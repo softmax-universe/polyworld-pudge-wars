@@ -279,26 +279,14 @@ when not defined(headless):
       width, 0'i32, 120'i32, 5'i32, enabled)
     if runeSeconds != previousRunes:
       config.runePeriod = runeSeconds * TickRate
-    let difficultyAt = fields + vec2(0, 192)
-    sk.lobbyLabel("Bot difficulty", difficultyAt, 180)
-    let buttonWidth = (width - 212) / 3
-    for difficulty in BotDifficulty:
-      var sample = config
-      sample.setDifficulty(difficulty)
-      let chosen = sample.botEvery == config.botEvery and
-        sample.botAimNoise == config.botAimNoise
-      if sk.lobbyButton($difficulty, difficultyAt +
-        vec2(196 + (buttonWidth + 8) * difficulty.ord.float32, 0), buttonWidth,
-        enabled = enabled, selected = chosen, height = 40):
-          config.setDifficulty(difficulty)
-    let seedAt = fields + vec2(0, 240)
+    let seedAt = fields + vec2(0, 192)
     sk.lobbyNumber("Map seed", config.seed, seedAt, width - 54,
       int32.low, int32.high, 1'i32, enabled)
     if sk.lobbyButton("", seedAt + vec2(width - 44, 0), 44,
       "shuffle", enabled, height = 40):
         config.seed = rng.rand(1 .. int32.high.int).int32
     if public != nil:
-      let visibility = fields + vec2(0, 288)
+      let visibility = fields + vec2(0, 240)
       sk.lobbyLabel("Visibility", visibility, 190)
       let part = (width - 204) * 0.5'f
       if sk.lobbyButton("Public", visibility + vec2(196, 0), part, "",
