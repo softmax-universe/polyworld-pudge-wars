@@ -1,14 +1,15 @@
 # Build and run Pudge Wars
 
-Run the commands from the Pudge Wars checkout. The relay client currently
-requires the paired local Polyworld checkout at
-`7b014a3e8a3bdef4d34fdd8b6debb94786245447`, the revision in `nimby.lock`.
-Point `PUDGEWARS_POLYWORLD` at that checkout for setup and all builds until
-the shared commit is published. `scripts/setup.sh` uses the supplied engine
-and installs Nim 2.2.10 and the remaining locked packages.
+Run the commands from the Pudge Wars checkout. `scripts/setup.sh` installs Nim
+2.2.10 and the packages pinned in `nimby.lock`. The validated shared engine is
+`7b014a3e8a3bdef4d34fdd8b6debb94786245447`, published on Polyworld's
+`pudge-relay-multiplayer` branch. For engine development, optionally point
+`PUDGEWARS_POLYWORLD` at a checkout of that revision before setup and builds.
+Setup then uses that engine and installs the remaining locked packages.
 
 ```sh
-export PUDGEWARS_POLYWORLD=/path/to/polyworld-pudge-multiplayer
+# Optional when developing against a matching shared-engine checkout:
+# export PUDGEWARS_POLYWORLD=/path/to/polyworld-pudge-multiplayer
 scripts/setup.sh
 export PATH="$HOME/.nimby/nim/bin:$HOME/.local/bin:$PATH"
 export PUDGEWARS_DEPS="${NIMBY_HOME:-$HOME/.nimby}/pkgs"
@@ -85,10 +86,10 @@ Open [Pudge Wars on localhost](http://127.0.0.1:8080/).
 ## Multiplayer relay
 
 In a separate terminal, use the same `PUDGEWARS_POLYWORLD` and
-`PUDGEWARS_DEPS` settings. Build and start the relay from the paired checkout.
+`PUDGEWARS_DEPS` settings. Build and start the relay from the pinned engine.
 
 ```sh
-cd "$PUDGEWARS_POLYWORLD"
+cd "${PUDGEWARS_POLYWORLD:-$PUDGEWARS_DEPS/polyworld}"
 mkdir -p build
 POLYWORLD_DEPS="$PUDGEWARS_DEPS" nim c -o:build/gameserver tools/gameserver.nim
 ./build/gameserver
