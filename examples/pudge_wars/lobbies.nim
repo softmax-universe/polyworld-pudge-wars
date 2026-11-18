@@ -204,13 +204,15 @@ when not defined(headless):
     sk.popLayer()
 
   proc drawArenaPreview(sk: Silky, config: MatchConfig, at, size: Vec2) =
-    ## Draws the playable bank edges, fountain, and actual seeded spawn pads.
+    ## Fits the playable arena and its seeded pads with square map tiles.
     sk.lobbyPanel(at, size, true)
     let
-      origin = at + vec2(12)
-      dimensions = size - vec2(24)
-      tile = vec2(dimensions.x / PlayableWidthTiles.float32,
-        dimensions.y / PlayableDepthTiles.float32)
+      available = size - vec2(24)
+      tile = vec2(min(available.x / PlayableWidthTiles.float32,
+        available.y / PlayableDepthTiles.float32))
+      dimensions = vec2(PlayableWidthTiles.float32,
+        PlayableDepthTiles.float32) * tile
+      origin = at + (size - dimensions) * 0.5'f
       west = rgbx(95, 49, 39, 255)
       east = rgbx(43, 54, 74, 255)
     sk.drawRect(origin, dimensions, rgbx(59, 27, 19, 255))
@@ -222,15 +224,18 @@ when not defined(headless):
       sk.drawRect(origin + vec2(0, y), vec2(westEdge, tile.y + 0.1'f), west)
       sk.drawRect(origin + vec2(eastEdge, y),
         vec2(dimensions.x - eastEdge, tile.y + 0.1'f), east)
-      let middle = (RiverCenterX - PlayWestMin).float32 * tile.x
+      let middle = ((RiverCenterX - PlayWestMin).float32 + 0.5'f) * tile.x
       sk.drawRect(origin + vec2(middle - tile.x, y),
         vec2(tile.x * 2, tile.y + 0.1'f), rgbx(123, 57, 24, 255))
     proc padAt(x, z: int): Vec2 =
-      ## Maps an arena tile coordinate to the minimap overlay.
-      origin + vec2((x - PlayWestMin).float32 * tile.x,
-        (z - PlayZMin).float32 * tile.y)
-    sk.drawRect(padAt(IslandCenterX, IslandCenterZ) - vec2(11, 7),
-      vec2(22, 14), rgbx(198, 157, 96, 255))
+      ## Maps a tile center to the uniformly scaled preview.
+      origin + (vec2((x - PlayWestMin).float32,
+        (z - PlayZMin).float32) + vec2(0.5'f)) * tile
+    for z in IslandCenterZ - IslandRadius .. IslandCenterZ + IslandRadius:
+      for x in IslandCenterX - IslandRadius .. IslandCenterX + IslandRadius:
+        if islandTile(x, z):
+          sk.drawRect(padAt(x, z) - tile * 0.5'f, tile + vec2(0.1'f),
+            rgbx(198, 157, 96, 255))
     let pads = spawnLayoutFromSeed(config.seed, config.teamSize)
     for i in 0 ..< config.teamSize:
       sk.drawRect(padAt(pads.west[i].x, pads.west[i].z) - vec2(4), vec2(8), LobbyRed)
