@@ -90,6 +90,67 @@ block:
   doAssert game.humanPaced and not game.networked
   game.closeBotServices()
 
+block bufferedBotDecision:
+  echo "Checking buffered ticks retain pending bot decisions until applied"
+  let
+    relay = Relay()
+    client = RoomClient(identity: identity(), name: "Buffered owner")
+    links = [Link(client: client, connection: 1)]
+  var
+    time = 0.0
+    config = defaultConfig()
+    sources: array[MaxPudgeCount, string]
+  config.maxTicks = 8
+  sources[5] = "a = rotToggle()"
+  client.opened()
+  relay.pump(links, time)
+  client.send(RoomMessage(
+    kind: CreateRoom, name: "Buffered commands", number: MaxPudgeCount,
+    tickRate: uint32(NetworkTickRate), payload: config.encodeConfig()
+  ))
+  relay.pump(links, time)
+  client.claimHuman(0)
+  client.send(RoomMessage(
+    kind: ClaimSeat, seat: 5, seatKind: BotSeat, name: "Buffered bot"
+  ))
+  relay.pump(links, time)
+  let match = prepareNetworkMatch(client, sources)
+  defer: match.close()
+  client.send(match.startRequest())
+  relay.pump(links, time)
+  match.beginMatch()
+  let bot = match.game.heroVms[1]
+  doAssert bot.decisions == 1 and client.hasPendingCommand(5)
+  var commands: seq[string]
+  let outgoing = move(client.outgoing)
+  for bytes in outgoing:
+    if decode(bytes).kind == SubmitCommand:
+      commands.add bytes
+    else:
+      client.outgoing.add bytes
+  doAssert commands.len == 1
+  relay.pump(links, time)
+  for step in 1 .. 2:
+    relay.sealTick(time)
+    relay.pump(links, time)
+  client.outgoing.add commands
+  relay.pump(links, time)
+  relay.sealTick(time)
+  relay.pump(links, time)
+  doAssert client.applied == 0 and client.packets.len == 3
+  for tick in 1 .. 2:
+    doAssert match.advanceNetwork()
+    doAssert client.applied == uint32(tick)
+    doAssert bot.decisions == 1,
+      "A buffered bot command must block the premature second decision"
+    doAssert client.hasPendingCommand(5)
+    doAssert not match.game.world.pudges[1].rotOn
+  doAssert match.advanceNetwork()
+  doAssert client.applied == 3 and match.game.world.pudges[1].rotOn
+  doAssert bot.decisions == 2,
+    "The next decision may run after its earlier command is applied"
+  doAssert client.hasPendingCommand(5), "The new decision remains pending"
+
 echo "Checking private bot owners, authoritative inputs and spectator history"
 let relay = Relay()
 var

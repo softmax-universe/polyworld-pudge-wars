@@ -22,12 +22,13 @@ without Tailscale Funnel.
 - The agent starts at login and restarts the relay if it exits.
 
 The installed relay uses Polyworld commit
-`3cc3a0650008533a1200142bc527a0b9226c7682`, matching `nimby.lock`.
+`3cc3a0650008533a1200142bc527a0b9226c7682`. The newer client dependency in
+`nimby.lock` fixes pending-command handling without changing this server.
 Its server, room protocol, and relay sources are byte-for-byte identical to
 upstream `a8cd9868`. It routes protocol 5 packets without interpreting Pudge
 rules, configuration, or actions. All game-specific validation is in the client.
 The installed `build.json` records the binary checksum and source revisions;
-the browser's `build.json` records its matching client build.
+the browser's `build.json` records its client build and dependency revision.
 
 ## Check the service
 
