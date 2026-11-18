@@ -18,6 +18,8 @@ async function until(label, predicate, timeout = 25000) {
 }
 const RoomProtocolVersion = 5;
 const HumanSeat = 0;
+const WestSeat = 0;
+const EastSeat = 5;
 const ActionRotToggle = 17;
 const kinds = (
   'Hello Welcome ListRooms RoomList CreateRoom JoinRoom RoomState ConfigureRoom ' +
@@ -135,8 +137,8 @@ function decode(data) {
     await until('host WebSocket Welcome', () => west.participant() > 0);
     await west.click(1043, 459);
     await until('host creates a room with a human seat', () =>
-      west.room()?.room && west.room().seats[0]?.owner === west.participant() &&
-      west.room().seats[0].kind === HumanSeat);
+      west.room()?.room && west.room().seats[WestSeat]?.owner === west.participant() &&
+      west.room().seats[WestSeat].kind === HumanSeat);
     console.log('Room created', west.room().room);
     const east = await createPeer('Arena Input QA Guest', west.room().room);
     await until('guest takes a human seat in the same room', () =>
@@ -147,10 +149,10 @@ function decode(data) {
     await east.click(645, 292);
     await until('both peers observe the guest moving across the river', () =>
       [west, east].every((peer) =>
-        peer.room()?.seats[0]?.owner === west.participant() &&
+        peer.room()?.seats[WestSeat]?.owner === west.participant() &&
         peer.room().seats[1]?.owner === 0 &&
-        peer.room().seats[3]?.owner === east.participant() &&
-        peer.room().seats[3].kind === HumanSeat) &&
+        peer.room().seats[EastSeat]?.owner === east.participant() &&
+        peer.room().seats[EastSeat].kind === HumanSeat) &&
       west.room().revision === east.room().revision);
     console.log('Guest moved to East');
     await west.click(1142, 754);
@@ -160,8 +162,8 @@ function decode(data) {
     await until('both peers receive the same immutable setup', () =>
       [west, east].every((peer) => peer.received.some((packet) =>
         packet.kind === 'BeginMatch' && packet.revision === start.revision &&
-        packet.hash === start.hash && packet.seats[0]?.owner === west.participant() &&
-        packet.seats[3]?.owner === east.participant())));
+        packet.hash === start.hash && packet.seats[WestSeat]?.owner === west.participant() &&
+        packet.seats[EastSeat]?.owner === east.participant())));
     await until('both clients render live network ticks',
       () => west.reports.at(-1)?.tick >= 12 && east.reports.at(-1)?.tick >= 12, 45000);
     console.log('Both arenas running', west.reports.at(-1).tick, east.reports.at(-1).tick);
@@ -176,7 +178,7 @@ function decode(data) {
     const submissions = [west, east].map((peer) => ({
       ...submittedRot(peer), participant: peer.participant()
     }));
-    assert.deepEqual(submissions.map((input) => input.seat), [0, 3]);
+    assert.deepEqual(submissions.map((input) => input.seat), [WestSeat, EastSeat]);
     const confirmedRot = (peer, input) => peer.received.find((packet) =>
       packet.seats?.[input.seat]?.owner === input.participant &&
       packet.seats[input.seat].kind === HumanSeat &&
@@ -210,9 +212,9 @@ function decode(data) {
       west.sent.some((packet) => packet.kind === 'LeaveRoom') &&
       west.room()?.room === '');
     const vacancy = () => east.received.find((packet) =>
-      packet.kind === 'TickPacket' && packet.seats[0]?.owner === 0 &&
-      packet.seats[3]?.owner === east.participant() &&
-      packet.seats[3].kind === HumanSeat);
+      packet.kind === 'TickPacket' && packet.seats[WestSeat]?.owner === 0 &&
+      packet.seats[EastSeat]?.owner === east.participant() &&
+      packet.seats[EastSeat].kind === HumanSeat);
     await until('guest receives the released seat in an authoritative tick', vacancy);
     await until('guest keeps playing after the host leaves', () =>
       east.reports.some((report) => report.phase === 'live' && report.tick > vacancy().tick));
