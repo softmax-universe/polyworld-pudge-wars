@@ -55,6 +55,14 @@ Polyworld revision.
 
 ## Check replay playback
 
+The shared browser loader defaults to a 64 MiB replay byte limit. A game's
+HTML shell can set `Module.polyworldMaxReplayBytes` to a positive integer
+before loading its compiled JavaScript. The limit applies to both downloaded
+bytes and decompressed bytes, and is independent of server match duration.
+Pudge keeps the default because its own replay decoder also accepts at most
+64 MiB. Other games can choose a budget suited to their decoder and browser
+memory requirements.
+
 An existing Playwright/Chromium installation can run the browser replay test
 under a restrictive Content Security Policy. Use a supported replay containing
 at least 64 recorded ticks.
