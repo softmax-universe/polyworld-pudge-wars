@@ -97,3 +97,6 @@ POLYWORLD_DEPS="$PUDGEWARS_DEPS" nim c -o:build/gameserver tools/gameserver.nim
 The default endpoint is `ws://127.0.0.1:8090/ws`. Open Multiplayer and enter
 the relay address and your player name. Clients on different machines need
 a relay address they can all reach.
+
+See [Tailscale deployment](tailscale.md) for the installed `work-computer`
+relay and its Games Showcase client.
