@@ -2,7 +2,7 @@
 
 import
   std/os,
-  polyworld/cli,
+  pudgewars/cli,
   ../examples/pudge_wars/[bots, content, maps, replays, sim]
 
 const BasePolicy {.strdefine.} = ""

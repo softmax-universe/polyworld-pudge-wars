@@ -1,8 +1,7 @@
 # Pudge Wars training bridge
 
-`examples/pudge_wars/training_host.nim` runs the hosted Nim simulation without
-the WebSocket clock. It calls the same `observation` and `applyAction` functions
-as the game server. The learner sees one fog-clipped butcher seat; all other
+`examples/pudge_wars/training_host.nim` runs the local Nim simulation and calls
+`observation` and `applyAction` from `examples/pudge_wars/observations.nim`. The learner sees one fog-clipped butcher seat; all other
 seats run the bundled `base.bas` opponent. The Python bridge adds a compact
 semantic question, a 191-value numeric observation, seven action heads, and
 the bundled Base Python teacher. It accepts `reset`, `encode`, `teacher`, and
@@ -32,6 +31,5 @@ bridge returns a terminal utility from the certified kill goal or time limit.
 
 The numeric action fields cover walking, hooking, blinking, attacks, item and
 upgrade purchases, Rot, ward/wall/mine placement, pings, and halting. Spatial
-targets use tile coordinates from the hosted JSON protocol. The Jev question
-offers visible enemy, river, and hold choices. Bot opponents use the native
-BASIC policy; they are training opponents, not a replay of hosted player pods.
+targets use the same tile coordinates as the local JSON observations. The Jev question
+offers visible enemy, river, and hold choices. The other seats use the native BASIC training opponent.

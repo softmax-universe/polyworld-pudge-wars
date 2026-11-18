@@ -18,9 +18,7 @@
 ## This module must not import anything that returns a float.
 
 import
-  polyworld/[
-    bodies, fixed, hashes, noises, pathing, profiles, rngs, tapes
-  ],
+  polyworld/[bodies, hashes, noises, pathing, profiles, rngs, tapes], fixxy,
   cheats,
   content,
   maps,
@@ -392,6 +390,8 @@ type
     hashCheck*: ReplayHashCheck
     historyPlayback*: bool
     replayMode*: bool
+    networked*: bool
+      ## Bot controllers may live on other participants.
     recordingError*: string
     heroVms*: seq[HeroVm]
     maximumTicks*: int32
@@ -543,7 +543,15 @@ proc safeMulDiv(num, mul, den: int64): int64 =
       d = d shr 1
   if d <= 0:
     return 0
-  roundDivision(n * mul, d)
+  let
+    numerator = n * mul
+    half = d div 2
+  # Preserve Pudge's legacy truncation when adding the rounding bias overflows.
+  if numerator == low(int64) or
+    (numerator >= 0 and numerator > high(int64) - half) or
+    (numerator < 0 and -numerator > high(int64) - half):
+      return numerator div d
+  roundDivision(numerator, d)
 
 proc `-`(first, second: WorldPoint): WorldPoint =
   WorldPoint(

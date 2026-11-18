@@ -1,16 +1,34 @@
-# Pudge Wars BASIC league migration
+# Pudge Wars BASIC episodes and league history
 
-The default `coworld/` package is now **pudge-wars-basic**, using game-hosted
-BASIC files. `coworld/platform-hosted/` preserves the `pudge-wars` Docker-player
-package and human-play entrypoint. Existing Docker uploads cannot enter the
-BASIC runtime; they need replacement `.bas` submissions. The public 3v3 league was migrated on 2026-10-09; its 37 container memberships
-were retired and its three container fillers replaced. The sibling 1v1 league
-continues using the platform-hosted package.
+## Local execution after the multiplayer migration
 
-Reference contracts were checked on 2026-10-09 against Polyworld
-`743f108091ca20b78f7e3fdc1a42f59ddb4ac795` and Metta
-`d92408b26a` main. The dependency lock pins the same Bassy and Fixxy revisions
-as that Polyworld release. This replaces the vendored `polyworld/basic.nim` VM.
+The Pudge Wars relay multiplayer client now handles human rooms. The former
+`pwcoworld` server, `/ws` game protocol, `/player` policy socket, `/global`
+spectator socket and `coworld/platform-hosted/` package were removed. The
+legacy browser and coaching launchers `scripts/play_policy.py`,
+`scripts/coach_demo.sh` and `python -m coaching.symbolic.play` used those sockets.
+Use the game’s Multiplayer menu for relay play or the Single Player menu for a
+local match against BASIC policies.
+
+The `pwleague` executable now runs one staged BASIC episode and exits. Rebuild
+it from `examples/pudge_wars/episodes.nim` before using `--binary` with
+`scripts/run_episode.py`. Its contract uses local `file://` URIs for the config,
+policy seats, failure, results and replay. Staged rosters use
+`coworld-player-seats/1` or `coworld-player-seats/2`. The former
+`coworld-play-seats/1` roster and collectors depending on a live `/healthz`
+endpoint require their original release. Published release IDs and checksums
+are recorded in [deployment.json](deployment.json).
+
+Local training uses [the JSONL bridge](TRAINING.md). Symbolic policy evaluation
+uses `python3 -m coaching.symbolic.evaluate`. Both use the native simulation and
+fog-filtered observations through local subprocesses. Use the replay verifier
+from this checkout to inspect newly written episode replays. The viewer pinned
+in the historical release record reads the replay format from that release.
+
+The public 3v3 league moved from container players to game-hosted BASIC files
+on 2026-10-09. Its 37 container memberships were retired and its three
+container fillers were replaced. The historical sibling duel league used the
+platform-hosted package. The evidence from that migration is below.
 
 ## Player contract
 
@@ -69,45 +87,9 @@ rejections. Limits are 1,000 records, 2 KiB per record and 2 MiB per episode per
 seat. Native play exposes the same functions with annotations disabled. The
 annotation sink is ported from the pinned Polyworld `src/polyworld/annotations.nim`.
 
-All logs, annotations, status and replay bytes finish before the atomic results
-marker. The process stays available for collection; `/healthz`, the global
-viewer, and WebSocket Ping/Pong remain live. League episodes accept no JSON
-player actions or human seat connections.
-
-## Humans alongside BASIC policies
-
-The `human` variant supports 3v3 hosted play with the same BASIC files. The
-hosted-play service must support file policies and set `COGAME_PLAY_SESSION_ID`.
-A league lobby episode a person joined (a ranked match played from the desktop
-client) sets no play session id; its runner stages the same play-seats roster
-with the person's seat marked human, and the host treats a roster with human
-seats as human play too. Either launch enables `/ws` human connections and the
-28 Hz human clock; ordinary league launches still run automated episodes as
-fast as possible.
-
-Hosted play stages `COGAME_PLAYER_SEATS_URI` as `coworld-play-seats/1`. Its
-`seats` array has one entry per configured token, in slot order. Human entries
-contain `slot` and `kind: "human"`. Policy entries contain `kind: "policy"`
-plus the usual verified `file_uri`, `size_bytes`, `content_hash`, `log_uri`,
-and optional `annotations_uri`. `player_status_uri` records policy seats only.
-Policy tokens cannot take over a human connection, and humans can reconnect to
-their own seat.
-
-All policy files load before the match waits for humans. The match starts when
-the human seats connect, without waiting for nonexistent policy containers.
-On completion or policy compilation failure the process exits, allowing the
-hosted-play collector to retain replay, results and private policy outputs.
-
-Run the real mixed-match check with:
-
-```bash
-PUDGE_LEAGUE_BINARY=tmp/pwleague python3 tests/test_pw_basic_play.py
-```
-
-Publish this host and deploy the platform file-policy play support together.
-The previously published `pudge-wars-basic:0.1.1` remains ranked-only. Point
-the site's `COWORLD_ID` at the new release; `ARENA_WSS` remains a direct-host
-override whose roster is configured on that host.
+All logs, annotations, status and replay bytes finish before the runner writes
+its atomic results marker and exits. Local callers can wait for process exit
+before collecting artifacts.
 
 ## League settings
 
@@ -133,8 +115,7 @@ all 24 episodes. Other authors must submit new BASIC or neural package policies.
 
 ## Run local BASIC episodes without Docker
 
-`scripts/run_episode.py` uses the same game-hosted loader and simulation as the
-league. It accepts bundled names or custom source paths, and expands a trailing
+`scripts/run_episode.py` uses the staged BASIC loader and native simulation. It accepts bundled names or custom source paths, and expands a trailing
 `:COUNT` into independent seats. The first half of the roster is West; the
 second half is East. Rosters of 2, 4, 6, 8 and 10 are supported.
 
@@ -150,18 +131,18 @@ python3 scripts/run_episode.py base:3 sniper:3 --seed 29
 # Different policy in each seat, with a custom file.
 python3 scripts/run_episode.py ./my-policy.bas support patient aggressive denier sniper
 
-# Short development episode using an already built league host.
+# Short development episode using an already built episode runner.
 python3 scripts/run_episode.py challenger:2 support:2 \
   --binary tmp/pwleague --ticks 1024 --output tmp/my-episode
 ```
 
 Bundled names are `base`, `aggressive`, `challenger`, `denier`, `patient`,
-`sniper` `support` and `jev`; `.bas` suffixes also work. Custom paths resolve from
+`sniper`, `support` and `jev`; `.bas` suffixes also work. Custom paths resolve from
 your shell's current directory. Raw BASIC and neural ZIPs are detected by content, regardless of filename
 extension. Use `--llm` to enable local host-configured Jev/LLM calls. Old integer-only policies must replace integer `/`
 expressions with `\` before using fractional values with integer host arguments.
 
-Without `--binary`, the command compiles a fresh host using `NIM` or `nim` on
+Without `--binary`, the command compiles a fresh runner using `NIM` or `nim` on
 PATH; `--nim /path/to/nim` overrides it. Install the locked dependencies first.
 No art, graphics, account, Docker daemon or hosted credits are needed.
 `--ticks`, `--kill-goal`, `--seed` and `--timeout` control the episode.
@@ -173,10 +154,10 @@ runner config and seats documents, and `episode.json` with source/binary hashes.
 Exact source snapshots live at `players/<slot>/file`. Explicit output directories
 must be new or empty. Re-running a roster and seed reproduces results/replay bytes.
 
-Exit codes distinguish success (0), input/build/host/timeout failures (1),
+Exit codes distinguish success (0), input/build/runner/timeout failures (1),
 policy compilation failures (2), and completed games with disabled VMs (3).
-Runtime-error episodes retain their results and replay for diagnosis. The host
-is stopped after collection, including on timeout and interruption.
+Runtime-error episodes retain their results and replay for diagnosis. Timeout
+and interruption stop the runner and retain partial artifacts.
 
 To watch or verify a saved replay:
 
@@ -190,56 +171,30 @@ nim c -d:headless -o:tmp/pwheadless-local examples/pudge_wars/pw.nim
 tmp/pwheadless-local --replay tmp/my-episode/replay.pwr
 ```
 
-## Validate and publish
+## Validate local execution
 
-With Nim 2.2.10 and `nimby.lock` dependencies installed:
+With Nim 2.2.10 and the locked dependencies installed, run the staged file,
+local episode, training and replay test suite.
 
 ```bash
 bash scripts/test_league.sh
-# Optional graphical/native compatibility build:
-nim c -o:tmp/pw-native examples/pudge_wars/pw.nim
 ```
 
-The tests cover seat isolation, private logs/annotations, syntax/source/runtime
-limits, all five roster sizes, native/file decision parity, hash-exact replays,
-HTTP health/viewers, complete 3v3 episodes and output-failure ordering.
-
-The package reuses upstream's certified simulator-37 replay viewer, pinned by
-SHA-256. A test prevents publishing it with another simulator version. This
-avoids rebuilding unchanged art/WASM for each league release. To publish a
-changed renderer or simulator, rebuild using `tools/build_replay_viewer.sh`
-with Emscripten and the art checkout, then certify and update the viewer pin.
-
-With a running Docker daemon:
+Build the local batch image with a running Docker daemon.
 
 ```bash
-coworld build --project coworld --version 0.1.2 --output dist/coworld_manifest.json
-coworld run-episode coworld/dist/coworld_manifest.json
-coworld certify coworld/dist/coworld_manifest.json
-coworld upload-coworld coworld/dist/coworld_manifest.json --wait-certification
-coworld upload-policy --file coworld/players/base.bas --name pudge-basic-base
+docker compose -f coworld/compose.yaml build
 ```
 
-Submit file-policy versions to the migrated BASIC league. Compare
-hosted outcomes and replay playback, verify the canonical game and league
-settings by readback, then enable scheduling. The deploy workflow is manual
-while this migration is being introduced and publishes `pudge-wars-basic`.
-It does not modify league settings or promote policies.
+The manual episode-image workflow builds the image and runs a short episode
+with networking disabled. Its artifact checks use the same local CLI. The
+source manifest describes the batch file contract. New hosted certification
+would require a compatible batch collector and a replay viewer built for the
+current format.
 
-Build the retained human/Docker package with
-`coworld build --project coworld/platform-hosted --version <version>`.
-Its Compose target uses `pwcoworld`; the BASIC package uses `pwleague` in a
-Python-free game image with Linux LTO. Both include the same simulator.
+## Historical verification, 2026-10-09
 
-The latest upstream [training bridge](TRAINING.md) is also included. It exposes
-the hosted observation/action contract to Metta RL and post-training while
-running the migrated BASIC opponents. The test script validates reset,
-the 191-value/seven-head codec, teacher actions and terminal results for both
-duel and 3v3 rosters.
-
-## Local verification, 2026-10-09
-
-`scripts/test_league.sh` covers nine Nim suites, six host integration tests,
+The original migration verified nine Nim suites, six host integration tests,
 the local episode command and the training bridge. The local matrix runs every
 bundled policy in full duels on both banks, mixed 2v2/3v3/4v4/5v5 rosters,
 custom paths, persistent strings/annotations, repeatability and failure cases.

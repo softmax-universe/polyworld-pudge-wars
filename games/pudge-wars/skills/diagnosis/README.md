@@ -13,7 +13,7 @@ mechanism at a specific policy branch before changing it.
 | Failed defense / capture | Threat heading, Blink readiness/use, first catch, escape and subsequent death | `base.py`: `threat`, Blink, river and low-HP branches |
 | Failed conversion | Enemy catch → follow-up headshot/melee/kill; danger to other allies | `base.py`: `caught`, `brawl`, attack and Rot branches |
 | Economy or vision stall | Real purchases, effective heals, missed shop visits, upgrade points and ward version | `base.py`: shop and modern-ward branches |
-| Execution failure | Observation age, sent/accepted actions, rejected reason, exceptions or budget exhaustion | `coworld_host.nim`, policy driver/private logs |
+| Execution failure | Observation tick, sent/accepted actions, rejected reason, exceptions or budget exhaustion | `examples/pudge_wars/observations.nim`, private policy logs |
 
 These are investigation categories, not assertions that every failure is
 present. Logged kill causes are estimates. Current v10 has no decision trace;

@@ -227,9 +227,7 @@
         if (window.pwHandleGameLine && window.pwHandleGameLine(line)) {
           return;
         }
-        // Fatal game output (Nim's quit message) lands on the loading
-        // screen instead of dying silently in the console, and join
-        // progress keeps the wait honest while the lobby holds.
+        // Fatal game output (Nim's quit message) lands on the loading screen.
         // Hash mismatch is not fatal: playback continues (the tape
         // player already counts mismatches and keeps going). Treating
         // it as a boot error froze Observatory Featured Match under
@@ -238,60 +236,13 @@
         if (/hash mismatch/i.test(text)) {
           return;
         }
-        if (/^(join failed|error|fatal)/i.test(text)) {
+        if (/^(error|fatal)/i.test(text)) {
           bootError(text + ' — reload the page to retry');
-          return;
-        }
-        if (/^join:/i.test(line)) {
-          var note = document.getElementById('bootNote');
-          if (note && note.className.indexOf('error') === -1) {
-            note.dataset.live = '1';
-            note.textContent = line.replace(/^join:\s*/i, '');
-          }
         }
       }
-      function replayParam() {
-        return new URLSearchParams(location.search).get('replay') ||
-          new URLSearchParams(location.hash.replace(/^#/, '')).get('replay');
-      }
-      var replayUrl = replayParam();
+      window.pwPresentationReady = bootGone;
       var Module = {
-        arguments: replayUrl ? ['--replay', '/replay.pwr'] : [],
-        preRun: [(function() {
-          if (!replayUrl) {
-            return;
-          }
-          Module.addRunDependency('replay');
-          function mountReplay(buf) {
-            var bytes = new Uint8Array(buf);
-            FS.writeFile('/replay.pwr', bytes, {encoding: 'binary'});
-            Module.removeRunDependency('replay');
-          }
-          function maybeGunzip(buf) {
-            var bytes = new Uint8Array(buf);
-            if (bytes.length >= 2 && bytes[0] === 0x1f && bytes[1] === 0x8b) {
-              return new Response(
-                new Blob([bytes]).stream().pipeThrough(
-                  new DecompressionStream('gzip')
-                )
-              ).arrayBuffer();
-            }
-            return Promise.resolve(buf);
-          }
-          fetch(replayUrl, {credentials: 'omit'})
-            .then(function(response) {
-              if (!response.ok) {
-                throw new Error('HTTP ' + response.status);
-              }
-              return response.arrayBuffer();
-            })
-            .then(maybeGunzip)
-            .then(mountReplay)
-            .catch(function(err) {
-              bootError('replay failed to load — ' + err);
-            });
-        })],
-        postRun: [],
+        polyworldError: bootError,
         print: function(text) {
           console.log(text);
           watchLine('' + text);
@@ -349,28 +300,14 @@
         onRuntimeInitialized: function() {
           Module.setStatus('Preparing the arena…');
           if (window.pwBoot) window.pwBoot.setProgress(1);
-          // The game sizes its canvas once the window comes up; that is
-          // the moment the first frame can draw. Never fade to a blank
-          // page: without a sized canvas keep the overlay and its note.
-          var canvas = document.getElementById('canvas');
-          var began = performance.now();
-          function watch() {
+          setTimeout(function() {
+            var boot = document.getElementById('boot');
             var note = document.getElementById('bootNote');
-            if (note && note.className.indexOf('error') >= 0) {
-              return;
+            if (boot && !boot.classList.contains('gone') &&
+                note && !note.classList.contains('error')) {
+              note.textContent = 'Still preparing the arena…';
             }
-            if (canvas.width > 400 || canvas.height > 400) {
-              bootGone();
-              return;
-            }
-            if (note && performance.now() - began > 25000 &&
-                note.dataset.live !== '1') {
-              note.textContent =
-                'Still working — is the host running? Keep this tab in the foreground.';
-            }
-            requestAnimationFrame(watch);
-          }
-          requestAnimationFrame(watch);
+          }, 25000);
         }
       };
       window.onerror = function(message) {

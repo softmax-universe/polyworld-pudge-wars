@@ -1,5 +1,5 @@
 ## Behavioral checks for the BASIC projection of retained Python v16/E06b.
-import std/[os, unittest], bassy, polyworld/cli,
+import std/[os, unittest], bassy, pudgewars/cli,
   ../examples/pudge_wars/[bots, content, maps, replays, sim]
 
 let policy = currentSourcePath().parentDir.parentDir /

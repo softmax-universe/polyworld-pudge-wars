@@ -1,23 +1,28 @@
 ## Window, terrain, butchers, hook ribbons, and HUD for Pudge Wars.
 
 import
-  std/[math, os, strutils, tables, times],
-  chroma, opengl, pixie, silky, vmath, windy,
-  audio, butcherhook, butcherknife, content, director, fog, maps, sim, game, human, keybinds, netclient, netsim,
-  netpredict, pacing, practice, replays, ui,
+  std/[math, os, tables, times, unicode],
+  chroma, gltf, opengl, pixie, shady, silky, vmath, windy,
   polyworld/[
-    actioncam, bottomhud, characters, chrome, common, gameuis, particles, particleshaders,
-    pathing, player, profiles, quadterrain, rtscameras, shadows, shapes,
-    tapes, terrainsurfaces, viewers, worldbars
-  , visions]
+    actioncam, assets, characters, chrome, connections, displays,
+    gameuis,
+    inputs, lobbies, menus, networks, particles, particleshaders, pathing,
+    player, pointers, profiles, quadterrain, rtscameras, shadows, shapes,
+    tapes, terrainsurfaces, viewers, visions, worldbars
+  ],
+  pudgewars/bottomhud,
+  audio, butcherhook, butcherknife, content, director, fog, game, homes, human,
+  keybinds, maps, multiplayer, pacing, practice, replays, sim, ui
 
-when not defined(emscripten):
-  # The embedded lobby server cannot run in a browser build; a wasm
-  # client is always a follower.
-  import hosting
+when defined(emscripten):
+  {.emit: "/*INCLUDESECTION*/\n#include <emscripten.h>".}
+else:
+  import std/tempfiles
+
+when defined(takeScreenshot):
+  import std/strutils
 
 const
-  AtlasPath = DataRoot & "/themes/pw.atlas.png"
   AppIconPath = "examples/pudge_wars/macos/AppIcon.png"
   WestHook = rgbx(220, 72, 64, 230)
   EastHook = rgbx(72, 148, 230, 230)
@@ -50,6 +55,11 @@ const
   FireTrailFill = rgbx(255, 86, 18, 120)
   FireTrailCore = rgbx(255, 196, 48, 165)
   FireTrailEmber = rgbx(255, 140, 32, 130)
+  RtsOrbitPitchMin = 0.22'f
+  RtsOrbitPitchMax = 1.42'f
+  RtsPointerPanPerDistance = 0.0015'f
+  RtsScrollPanPerDistance = 0.04'f
+  RtsKeyPanPerDistance = 1.1'f
   DefaultCameraDistance = 75.0'f32
     ## Starts at the closest shipped zoom (75–155). Clamped live by
     ## zoomMinDistance / zoomMaxDistance.
@@ -118,6 +128,39 @@ type
     team: Team
     slot: int
     born: float64
+
+var
+  window*: Window
+  sk*: Silky
+  scene: CharacterScene
+  terrainReady: bool
+  pudgeModels: array[Team, CharacterModel]
+  pudgeClips: array[Team, array[5, int]]
+  pudgeMeleeClips: array[Team, int]
+  handSockets: array[Team, array[2, Node]]
+  lavaTime: GLint
+
+proc rtsClampedPitch(pitch: float32): float32 =
+  ## Keeps orbit gestures above ground and short of the top-down singularity.
+  clamp(pitch, RtsOrbitPitchMin, RtsOrbitPitchMax)
+
+proc rtsCameraRight(yaw: float32): Vec3 =
+  ## Returns the horizontal camera right vector.
+  vec3(cos(yaw), 0, -sin(yaw))
+
+proc rtsCameraLook(yaw: float32): Vec3 =
+  ## Returns the horizontal vector from the target toward the camera.
+  vec3(sin(yaw), 0, cos(yaw))
+
+proc rtsGroundPan(yaw: float32, delta: Vec2, speed: float32): Vec2 =
+  ## Converts a pointer drag into an offset on the ground plane.
+  let pan = (rtsCameraRight(yaw) * delta.x + rtsCameraLook(yaw) * delta.y) * speed
+  vec2(pan.x, pan.z)
+
+proc orbitCameraEye(target: Vec3, distance, yaw, pitch: float32): Vec3 =
+  ## Returns the camera position for Pudge's orbit controls.
+  let p = rtsClampedPitch(pitch)
+  target + vec3(sin(yaw) * cos(p), sin(p), cos(yaw) * cos(p)) * distance
 
 proc renderPoint(position: WorldPoint): Vec3 =
   vec3(
@@ -996,10 +1039,121 @@ const
   FirepitFloor = vec3(1.04, 0.96, 0.86)
   FirepitSkirt = vec3(0.78, 0.62, 0.48)
 
-proc applyArenaTerrain(mapSeed: int) =
-  ## Volcanic rock floor at authored brightness. Gameplay kinds stay put.
-  seed = mapSeed
-  initTerrain(MixedTrees, GeneratedTerrain, PaintedRocks, FirepitTiles)
+const LavaShaderTarget =
+  when defined(emscripten): glsl3WebGL
+  else: glsl4Desktop
+
+var
+  mvp: Uniform[Mat4]
+  envLightDirection: Uniform[Vec3]
+  visibilityTex: Uniform[Sampler2d]
+  visibilityOffset, visibilityScale: Uniform[float32]
+
+var cameraPos: Uniform[Vec3]
+var waterTime: Uniform[float32]
+
+template lavaCell(ox, oz: untyped) =
+  ## One jittered Voronoi neighbor. Reads px/pz/waterTime; writes d1/d2.
+  let
+    cellX = ix + ox
+    cellZ = iz + oz
+    h1 = fract(sin(cellX * 127.1 + cellZ * 311.7) * 43758.5453)
+    h2 = fract(sin(cellX * 269.5 + cellZ * 183.3) * 43758.5453)
+    jx = (h1 - 0.5) * 0.84 + 0.14 * sin(waterTime * 0.70 + h1 * 6.2832)
+    jz = (h2 - 0.5) * 0.84 + 0.14 * sin(waterTime * 0.58 + h2 * 6.2832)
+    dx = px - cellX - jx
+    dz = pz - cellZ - jz
+    d = dx * dx + dz * dz
+  d2 = min(d2, max(d1, d))
+  d1 = min(d1, d)
+
+proc lavaVert(
+    gl_Position: var Vec4,
+    vertPos: Vec3,
+    normal: Vec3,
+    worldPos: var Vec3,
+    waterNormal: var Vec3
+) =
+  ## Emits water vertex outputs for the generated OpenGL shader.
+  gl_Position = mvp * vec4(vertPos.x, vertPos.y, vertPos.z, 1.0)
+  worldPos = vertPos
+  waterNormal = normal
+
+proc lavaFrag(
+    fragColor: var Vec4,
+    worldPos: Vec3,
+    waterNormal: Vec3
+) =
+  ## Packed lava cells: amber bowls, yellow-white ridges, glossy pops.
+  let
+    specular = pow(
+    max(dot(
+      normalize(waterNormal),
+      normalize(normalize(cameraPos - worldPos) + envLightDirection)
+    ), 0.0),
+    28.0)
+    visibilityUv = vec2(
+      (worldPos.x + visibilityOffset) * visibilityScale,
+      (worldPos.z + visibilityOffset) * visibilityScale
+    )
+    visibility = smoothstep(
+      0.05,
+      0.95,
+      texture(visibilityTex, visibilityUv).x
+    )
+    warpX = sin(worldPos.z * 0.34 + waterTime * 0.42) * 0.22
+    warpZ = sin(worldPos.x * 0.29 + waterTime * 0.36) * 0.22
+    px = (worldPos.x + warpX) * 0.46 + waterTime * 0.05
+    pz = (worldPos.z + warpZ) * 0.46
+    ix = floor(px)
+    iz = floor(pz)
+  var
+    d1 = 8.0
+    d2 = 8.0
+  lavaCell(-1.0, -1.0)
+  lavaCell(0.0, -1.0)
+  lavaCell(1.0, -1.0)
+  lavaCell(-1.0, 0.0)
+  lavaCell(0.0, 0.0)
+  lavaCell(1.0, 0.0)
+  lavaCell(-1.0, 1.0)
+  lavaCell(0.0, 1.0)
+  lavaCell(1.0, 1.0)
+  let
+    f1 = sqrt(max(d1, 0.0))
+    f2 = sqrt(max(d2, 0.0))
+    edge = f2 - f1
+    ridge = 1.0 - smoothstep(0.0, 0.12, edge)
+    ridge2 = ridge * ridge
+    bowl = clamp(f1 * 2.8, 0.0, 1.0)
+    pulse = 0.90 + 0.10 * sin(waterTime * 1.6 + px * 1.2 + pz * 0.8)
+    mottle = 0.78 + 0.22 * sin(px * 7.2 + pz * 5.8 + waterTime * 1.1) *
+      sin(px * 4.4 - pz * 6.5 + waterTime * 0.85)
+    glow = 0.92 + 0.08 * visibility
+    spec = specular * (0.06 + 0.18 * ridge2)
+    r = 0.40 + 0.50 * bowl + 0.22 * ridge2 * pulse
+    g = (0.04 + 0.16 * bowl + 0.18 * ridge2 * pulse) * mottle
+    b = 0.006 + 0.012 * bowl + 0.03 * ridge2
+  fragColor = vec4(
+    clamp(r * glow + spec, 0.0, 1.25),
+    clamp(g * glow + spec * 0.28, 0.0, 0.62),
+    clamp(b * glow + spec * 0.04, 0.0, 0.14),
+    0.97
+  )
+
+proc initArenaTerrain() =
+  ## Initializes the volcanic rock materials for the shared context.
+  waterShaderOverride = (
+    toShader(lavaVert, LavaShaderTarget, shaderVertex),
+    toShader(lavaFrag, LavaShaderTarget, shaderFragment)
+  )
+  var terrainAssets = DefaultTerrainAssets
+  terrainAssets.water = false
+  initTerrain(
+    MixedTrees, GeneratedTerrain, PaintedRocks, FirepitTiles,
+    settings = terrainAssets
+  )
+  lavaTime = glGetUniformLocation(waterShaderProgram(), "waterTime")
   terrainSplats = false
   setTileMaterial(
     int(GrassTile), FirepitRock.float32, FirepitJagged.float32,
@@ -1025,11 +1179,33 @@ proc applyArenaTerrain(mapSeed: int) =
     int(TreeTile), FirepitJagged.float32, FirepitRock.float32,
     FirepitFloor, FirepitSkirt, 0
   )
-  scatterRocks(70, mapSeed)
+  terrainReady = true
 
-proc runGraphics*() =
-  startProfileTrace()
-  beginPractice()
+proc graphicsPreferences(): Preferences =
+  ## Uses launch defaults when the saved settings cannot be opened.
+  try:
+    readPudgePreferences()
+  except MenusError, IOError, OSError:
+    Preferences(
+      bindings: PudgeControlProfile.defaults,
+      mainVolume: if options.mute: 0 else: 100
+    )
+
+proc initializeGraphics*(visible = true) =
+  ## Creates the application window and atlas shared by menus and matches.
+  if window != nil:
+    return
+  if options.mute:
+    configureSoundLaunch(true)
+  let preferences = graphicsPreferences()
+  let atlasPath =
+    when defined(emscripten):
+      "/tmp/pudge-wars-atlas.png"
+    else:
+      let (file, path) = createTempFile("pudge-wars-", ".png")
+      file.close()
+      path
+  defer: removeFile(atlasPath)
   profileBlock "atlas":
     let builder = newHudAtlas(4096)
     proc placeholderIcon(): Image =
@@ -1074,99 +1250,117 @@ proc runGraphics*() =
         continue
       addIcon(name, path)
     builder.addDefaultFonts()
+    builder.addLobbyFonts()
+    builder.addPudgeHomeAssets()
     # Bold HUD ramp: score banner, key badges, and slot labels.
     for size in [11, 12, 13, 15, 17, 24, 27, 54]:
       builder.addFont(BoldFontPath, "B" & $size, size.float32)
-    builder.write(AtlasPath)
-  var window: Window
-  var sk: Silky
+    builder.write(atlasPath)
   profileBlock "window":
     (window, sk) = initGameWindow(
       "Pudge Wars",
-      AtlasPath,
+      atlasPath,
       gameWindowSize(options.windowWidth, options.windowHeight),
       options.vsync,
-      iconPath = AppIconPath
+      visible = visible
     )
-    # A client that docks beside the game asks for an exact spot on screen.
-    if options.windowX >= 0 and options.windowY >= 0:
-      window.pos = ivec2(options.windowX, options.windowY)
+    when not defined(emscripten):
+      if fileExists(AppIconPath):
+        window.icon = readImage(AppIconPath)
+    window.onCloseRequest = proc() =
+      ## Restores the cursor on application close.
+      releaseCursorConfinement()
+    window.onFocusChange = proc() =
+      ## Releases confinement when focus leaves the window.
+      window.updateCursorConfinement()
   profileBlock "audio":
     initGameAudio(options.mute)
-    let keysFile =
-      if options.keysPath.len > 0: options.keysPath
-      else: "pudge_keys.cfg"
-    if loadKeyBinds(keysFile):
-      echo "keys: loaded ", keysFile
-      let
-        cliQuickcast = options.quickcast
-        cliAutocast = options.autocast
-      if fileQuickcastSet:
-        options.quickcast = fileQuickcast
-      if fileAutocastSet:
-        options.autocast = fileAutocast
-      if cliQuickcast:
-        options.quickcast = true
-      if cliAutocast:
-        options.autocast = true
-    elif options.keysPath.len > 0:
-      echo "keys: no such file ", options.keysPath
+    preferences.applyPreferences(
+      window, configureDisplay = options.windowWidth <= 0)
+  if options.windowX >= 0 and options.windowY >= 0:
+    window.pos = ivec2(options.windowX, options.windowY)
+  window.updateCursorConfinement(preferences.edgeScrolling)
+  loadPudgeControls(options.quickcast, options.autocast, options.keysPath)
 
-  when not defined(emscripten):
-    if netRole == NetHost:
-      var botSeatPaths: seq[string]
-      for group in options.botGroups:
-        for _ in 0 ..< group.count:
-          botSeatPaths.add group.path
-      if not startHosting(
-          options.hostPort,
-          netPlayerName(),
-          "examples/pudge_wars/emscripten",
-          run.world.killGoal,
-          run.world.runePeriod div TickRate,
-          botSeatPaths,
-          int(options.teamSize)
-      ):
-        quit("cannot start the lobby server on port " & $options.hostPort)
-      echo "host: lobby open at ", hostingUrl()
-      echo "host: native clients join with --join ws://<that address>/ws"
-      if options.humanSlots.len > 0:
-        hostClaimLocal(int(options.humanSlots[0]))
+proc closeGraphics*() =
+  ## Releases audio when the application exits.
+  releaseCursorConfinement()
+  closeGameAudio()
+
+proc runGraphics*(network: NetworkMatch = nil,
+    connection: Connection = nil): bool {.discardable.} =
+  ## Renders an installed match and reports whether to return to the main menu.
+  doAssert run != nil and networkActive == (network != nil)
+  doAssert (network == nil and connection == nil) or
+    (network != nil and connection != nil and network.client == connection.client and
+      network.game == run and network.started)
+  activeNetwork = network
+  defer: activeNetwork = nil
+  startGameProfile()
+  defer: finishGameProfile()
+  initializeGraphics()
+  beginPractice()
+  var
+    preferences = graphicsPreferences()
+    chainHands: Table[int32, Vec3]
+    leaveMatch, quitToMenu, leaveRequested: bool
+    lastAppliedAt = -1.0
+  when defined(emscripten):
+    var notifiedPresentation = false
+  configureMatchUi(network, connection, preferences.name)
+  defer: configureMatchUi(nil, nil)
+  spectatePudgeId = 0
+  resetHumanTransients()
+  clearKillFeed()
+  resetMatchRecap()
+  if network != nil:
+    connection.stats.tickRate = int(NetworkTickRate)
+    connection.playback = TickPlayback()
 
   profileBlock "terrain":
     amplitude = 1.15'f32
     treeHeight = 7.2'f32
-    applyArenaTerrain(run.map.seed)
+    seed = run.map.seed
+    clearSceneProps()
+    if not terrainReady:
+      initArenaTerrain()
+    scatterRocks(70, run.map.seed)
 
-  let scene = newCharacterScene(window)
-  scene.useToonShading()
-  var
-    pudgeModels: array[Team, CharacterModel]
-    pudgeClips: array[Team, array[5, int]]
-    pudgeMeleeClips: array[Team, int]
-    chainHands: Table[int32, Vec3]
-  profileBlock "models":
-    for team in Team:
-      let spec = PudgeSpecs[team]
-      let model = loadCharacterModel(spec.modelPath, spec.targetHeight)
-      pudgeModels[team] = model
-      pudgeMeleeClips[team] = model.clipIndex("ButcherChop")
-      pudgeClips[team] = [
-        model.clipIndex(spec.runClip),
-        model.clipIndex(spec.idleClip),
-        model.clipIndex(spec.deathClip),
-        model.clipIndex(spec.attackClip),
-        model.clipIndex(spec.victoryClip)
-      ]
+  if scene == nil:
+    profileBlock "models":
+      for team in Team:
+        let spec = PudgeSpecs[team]
+        let model = loadCharacterModel(spec.modelPath, spec.targetHeight)
+        pudgeModels[team] = model
+        for node in model.file.root.walkNodes:
+          case node.name
+          of "L_Hand": handSockets[team][0] = node
+          of "R_Hand": handSockets[team][1] = node
+          else: discard
+        pudgeMeleeClips[team] = model.clipIndex("ButcherChop")
+        pudgeClips[team] = [
+          model.clipIndex(spec.runClip),
+          model.clipIndex(spec.idleClip),
+          model.clipIndex(spec.deathClip),
+          model.clipIndex(spec.attackClip),
+          model.clipIndex(spec.victoryClip)
+        ]
+    scene = newCharacterScene(window)
+    scene.useToonShading()
   profileBlock "bake":
     bakeTerrain(rebuildWalkability = false)
 
+  var particles = initParticleSystem()
+  defer: particles.closeParticles()
+  var worldBarRenderer = initWorldBarRenderer()
+  defer: worldBarRenderer.closeWorldBarRenderer()
+  var shapeRenderer = initShapeRenderer()
+  defer: shapeRenderer.closeShapeRenderer()
+  var hookRenderer = initShapeRenderer()
+  defer: hookRenderer.closeShapeRenderer()
+  var knifeRenderer = initShapeRenderer()
+  defer: knifeRenderer.closeShapeRenderer()
   var
-    particles = initParticleSystem()
-    worldBarRenderer = initWorldBarRenderer()
-    shapeRenderer = initShapeRenderer()
-    hookRenderer = initShapeRenderer()
-    knifeRenderer = initShapeRenderer()
     transport = initPlayer(
       live = not run.replayMode,
       durationTicks =
@@ -1174,11 +1368,9 @@ proc runGraphics*() =
           int32(run.replayData.hashes.len)
         else:
           run.maximumTicks,
-      # A host idles in the lobby until Enter starts the match.
-      playing = not options.pauseOnStart and netRole != NetHost,
+      playing = network != nil or not options.pauseOnStart,
       speed = options.speed
     )
-    netLobbyOpen = netRole == NetHost
     cameraDistance = DefaultCameraDistance
     cameraYaw = RtsCameraYaw
     cameraPitch = RtsCameraPitch
@@ -1221,7 +1413,6 @@ proc runGraphics*() =
     renderAlpha = 1.0'f32
     animationAlpha = 0.0'f32
     lastFrameTime = epochTime()
-  hostLobbyOpen = netLobbyOpen
   if run.replayMode:
     transport.repeating = true
   if humanControlActive():
@@ -1265,14 +1456,11 @@ proc runGraphics*() =
         fogValues[i] = 72
       else:
         fogValues[i] = 26
-    blurVisibilityInto(
-      fogValues, fogBlurred, int32(GridTiles), int32(GridTiles)
-    )
+    fogBlurred = blurVisibility(fogValues, int32(GridTiles), int32(GridTiles))
     uploadTerrainVisibility(fogBlurred)
 
   proc recordedTicksNow(): int32 =
-    ## How much finished tape exists: recorded locally by the host's
-    ## sim, or streamed in from one when following.
+    ## Returns the number of ticks available to the local replay transport.
     if run.recorder != nil:
       int32(run.recorder.data.hashes.len)
     elif run.replayPlayer != nil:
@@ -1308,9 +1496,6 @@ proc runGraphics*() =
       previousRunePositions[rune.id] = renderPoint(rune.position)
 
   proc unitPoint(id: int32, position: WorldPoint): Vec3 =
-    if predictor.predictsUnit(id):
-      return renderPoint(predictor.localRenderPoint(
-        if interpolateVisuals: renderAlpha else: 1.0'f32))
     let current = renderPoint(position)
     if not interpolateVisuals:
       return current
@@ -1320,9 +1505,7 @@ proc runGraphics*() =
     let current = renderFacing(facing)
     if not interpolateVisuals:
       return current
-    let previous =
-      if predictor.predictsUnit(id): renderFacing(predictor.previousLocalFacing)
-      else: previousFacings.getOrDefault(id, current)
+    let previous = previousFacings.getOrDefault(id, current)
     previous + shortestTurn(previous, current) * renderAlpha
 
   proc hookPoint(id: int32, position: WorldPoint): Vec3 =
@@ -1421,7 +1604,7 @@ proc runGraphics*() =
         found = false
         pt = vec3(0)
       if humanControlActive() and heroIndex() >= 0:
-        let pudge = predictedPudge(heroIndex())
+        let pudge = run.world.pudges[heroIndex()]
         pt = unitPoint(pudge.id, pudge.position)
         found = true
       else:
@@ -1441,7 +1624,7 @@ proc runGraphics*() =
         actionCam.takeManual()
     cameraTarget.x = clamp(cameraTarget.x, -HalfGrid, HalfGrid)
     cameraTarget.z = clamp(cameraTarget.z, -HalfGrid, HalfGrid)
-    cameraEye = rtsCameraEye(
+    cameraEye = orbitCameraEye(
       cameraTarget, cameraDistance, cameraYaw, cameraPitch
     )
 
@@ -1581,7 +1764,8 @@ proc runGraphics*() =
         const EdgePixels = 12
         let mouse = window.mousePos
         # Fullscreen only. Window edges, including over the bottom HUD.
-        if viewerIsFullscreen(window) and
+        if rtsEdgePanAllowed(window.isFullscreen, window.mouseInside,
+            window.mouseCaptured, preferences.edgeScrolling) and
             not followSelection and not actionCam.enabled and
             not panKeyDown and mouse != ivec2(0, 0):
           let
@@ -1616,18 +1800,17 @@ proc runGraphics*() =
       cameraDistance = clampCameraDistance(
         cameraDistance * pow(0.92'f32, scroll.y)
       )
-    if not netLobbyOpen:
-      # Keyboard zoom so a trackpad is not required to change distance.
-      if window.buttonDown[KeyMinus]:
-        dropDirector()
-        cameraDistance = clampCameraDistance(
-          cameraDistance * pow(1.08'f32, dt * 8.0'f32)
-        )
-      if window.buttonDown[KeyEqual]:
-        dropDirector()
-        cameraDistance = clampCameraDistance(
-          cameraDistance * pow(0.92'f32, dt * 8.0'f32)
-        )
+    # Keyboard zoom so a trackpad is not required to change distance.
+    if window.buttonDown[KeyMinus]:
+      dropDirector()
+      cameraDistance = clampCameraDistance(
+        cameraDistance * pow(1.08'f32, dt * 8.0'f32)
+      )
+    if window.buttonDown[KeyEqual]:
+      dropDirector()
+      cameraDistance = clampCameraDistance(
+        cameraDistance * pow(0.92'f32, dt * 8.0'f32)
+      )
     applyFollowLock()
 
   proc emitBlinkOriginPuff(chest: Vec3) =
@@ -1691,9 +1874,9 @@ proc runGraphics*() =
           (pudge.rotTicks == 0 or pudge.rotTicks == RotPeriodTicks div 2):
         var cloud = pos
         cloud.y -= 0.95'f32
-        particles.emitParticleBurst(DecayAura, cloud)
+        particles.emitParticleBurst(PoisonAura, cloud)
         if pudge.rotTicks == 0:
-          particles.emitParticleBurst(DecayAura, cloud, 0.16'f32)
+          particles.emitParticleBurst(PoisonAura, cloud, 0.16'f32)
     if run.world.tick mod 20 == 0:
       const PitSpots = 3
       let stride = PlayZMax - PlayZMin + 1
@@ -1869,7 +2052,7 @@ proc runGraphics*() =
     ## bot hooks stay quiet.
     let
       now = epochTime()
-      audible = not transport.inHistory
+      audible = not transport.inHistory and window.focused
     proc heroIs(id: int32): bool =
       humanControlActive() and heroIndex() >= 0 and
         run.world.pudges[heroIndex()].id == id
@@ -2055,13 +2238,17 @@ proc runGraphics*() =
         hearAt(run.world.lightningPoint):
       playGameSound(SndHookClash, 0.7)
 
-  proc advanceRenderedSimulation() =
+  proc advanceRenderedSimulation(packet = RoomMessage()) =
+    ## Applies one simulation tick and emits the presentation for its transitions.
     captureUnitPositions()
-    advanceGame()
+    if network == nil:
+      advanceGame()
+    else:
+      network.applyPacket(packet)
     emitTickParticles()
     emitCombatFeedback()
-    if int(run.world.tick) mod (TickRate * 10) == 0 or
-        int32(run.world.tick) == transport.timelineEnd:
+    if network == nil and (run.world.tick mod (TickRate * 10) == 0 or
+        run.world.tick == transport.timelineEnd):
       if replayCheckpoints.len == 0 or
           replayCheckpoints[^1].tick < int(run.world.tick):
         replayCheckpoints.add captureCheckpoint()
@@ -2095,148 +2282,45 @@ proc runGraphics*() =
     while int32(run.world.tick) < targetTick:
       advanceGame()
 
-  proc resetMatchPresentation() =
-    ## Clears every client-side trace of the previous match.
-    replayCheckpoints = @[captureCheckpoint()]
-    previousPositions.clear()
-    previousFacings.clear()
-    previousHookPositions.clear()
-    previousRunePositions.clear()
-    previousHp.clear()
-    previousStates.clear()
-    previousThrown.clear()
-    floatingTexts.setLen(0)
-    blinkResidues.setLen(0)
-    fogExplored.setLen(0)
-    fogVisionTick = int32.low
-    particles.clearParticles()
-    spectatePudgeId = 0
-    resetHumanTransients()
-    clearKillFeed()
-    resetMatchRecap()
-    renderAlpha = 1
-    animationAlpha = 0
-    followSelection = false
-    cameraTarget = vec3(0, 0, 0)
-    cameraYaw = RtsCameraYaw
-    cameraPitch = RtsCameraPitch
-    orbiting = false
-    panning = false
-    rmbGesture = false
-    panKeyGesture = false
-    panKeyDragged = false
-    panTap = false
-    if humanControlActive():
-      actionCam.takeManual()
-      followSelection = true
-      let hero = heroGroundPoint()
-      cameraTarget.x = hero.x
-      cameraTarget.z = hero.z
-    else:
-      followSelection = false
-      actionCam.enabled = true
-      actionCam.locked = false
-      actionCam.lockId = 0
-
-  proc applyHostedSeats() =
-    ## Freezes the roster for a hosted match: the host's own seat plus
-    ## every remote claim drives a human seat; the rest stay bots.
-    ## Lobby seat numbers map through the (possibly compacted) roster.
-    when not defined(emscripten):
-      run.humanSlots.setLen(0)
-      if localSeat >= 0:
-        run.humanSlots.add localSeat
-      for seat in hostRemoteSeats():
-        let index = run.world.worldIndexOfSeat(seat)
-        if index >= 0 and index notin run.humanSlots:
-          run.humanSlots.add index
-
-  proc rematchNow() =
-    ## Fresh match on the same arena. A host takes everyone along by
-    ## rebroadcasting the new setup; a follower waits for exactly that.
-    if netRole == NetClient:
-      return
-    flushBugTapeIfArmed()
-    practiceFinish(run)
-    restartMatch()
-    beginPractice()
-    if netRole == NetHost:
-      applyHostedSeats()
-    transport = initPlayer(
-      live = true,
-      durationTicks = run.maximumTicks,
-      playing = true,
-      speed = options.speed
-    )
-    startReplayRecording(uint32(transport.durationTicks))
-    when not defined(emscripten):
-      if netRole == NetHost:
-        hostAnnounceStart(run)
-    resetMatchPresentation()
-
-  proc rebakeArena() =
-    ## Terrain follows `run.map` after a live N vs N resize.
-    applyArenaTerrain(run.map.seed)
-    bakeTerrain(rebuildWalkability = false)
-
-  proc startHostedMatch() =
-    ## Enter in the host lobby: lock seats, start the tape, tell every
-    ## connection, and let the world tick. Disabled seats rebuild the
-    ## world with a compacted roster first.
-    when not defined(emscripten):
-      block seatGuard:
-        var westOn, eastOn = 0
-        let n = hostTeamSize
-        for seat in 0 ..< hostSeatCount():
-          if seatDisabled[seat]:
-            continue
-          if seat < n: inc westOn else: inc eastOn
-        if westOn == 0 or eastOn == 0:
-          setHumanError("EACH TEAM NEEDS AT LEAST ONE SEAT")
-          return
-      setRosterExperiment(seatDisabled)
-      if activeRoster().len > 0:
-        rebuildWithRoster()
-      localSeat =
-        if localClaim >= 0: run.world.worldIndexOfSeat(localClaim)
-        else: -1
-      applyHostedSeats()
-      startReplayRecording(uint32(transport.durationTicks))
-      hostAnnounceStart(run)
-      netLobbyOpen = false
-      hostLobbyOpen = false
-      transport.playing = true
-      if humanControlActive():
-        followSelection = true
-        actionCam.takeManual()
-        let hero = heroGroundPoint()
-        cameraTarget.x = hero.x
-        cameraTarget.z = hero.z
+  proc applyMatchMenu(action: MatchMenuAction) =
+    ## Applies local navigation or sends the shared relay's match controls.
+    case action
+    of StayInMatch:
+      discard
+    of ToggleMatchPause:
+      if network == nil:
+        transport.togglePlay()
       else:
-        followSelection = false
+        let client = network.client
+        if client.welcomed and matchCanControl() and
+            client.snapshot.phase in {rooms.Playing, Waiting}:
+          client.send(RoomMessage(kind: PauseMatch,
+            match: client.match, flag: not client.snapshot.flag))
+    of Rematch:
+      leaveMatch = true
+    of ReturnToLobby:
+      let client = network.client
+      if client.snapshot.phase in {rooms.Ended, Desynced, Lobby}:
+        if client.welcomed and client.participant == client.snapshot.participant and
+            client.snapshot.phase != Lobby:
+          client.send(RoomMessage(kind: ReturnLobby))
+          client.error.setLen(0)
+        leaveMatch = true
+    of QuitToHome:
+      quitToMenu = true
+      if network == nil or not network.client.welcomed:
+        leaveMatch = true
+      elif matchCanControl() and
+          network.client.snapshot.phase in {rooms.Playing, Waiting}:
+        network.abort("Match ended by a player quitting to the main menu")
+      else:
+        network.client.send(RoomMessage(kind: LeaveRoom))
+        leaveRequested = true
 
-  proc netRematchNow(setup: Setup) =
-    ## The host rematched (or we reconnected): rebuild the follower
-    ## world from its setup (same arena) and stream on. Drop predicted
-    ## intents — they already live on the host tape we'll catch up to.
-    predictor.disable()
-    netClientRestart(setup)
-    transport = initPlayer(
-      live = true,
-      durationTicks = run.maximumTicks,
-      playing = true,
-      speed = options.speed
-    )
-    resetMatchPresentation()
-
-  if not run.replayMode and netRole == NetOff:
+  if not run.replayMode and network == nil:
     startReplayRecording(uint32(transport.durationTicks))
-  when not defined(emscripten):
-    if netRole == NetHost and options.autoStart:
-      # Skip the lobby: the match runs at once and joiners grab bot
-      # seats mid-game (also the scriptable smoke-test path).
-      startHostedMatch()
-  replayCheckpoints = @[captureCheckpoint()]
+  if network == nil:
+    replayCheckpoints = @[captureCheckpoint()]
 
   when defined(takeScreenshot):
     var screenshotFrame = 0
@@ -2265,21 +2349,33 @@ proc runGraphics*() =
     applyCaptureLook()
 
   const Step = 1.0'f32 / float32(TickRate)
-  # Bottom-left debug readout state: exponentially-smoothed render FPS,
-  # measured from the wall-clock gap between frame starts.
-  var fpsSmoothed = 0.0'f32
-  var fpsPrevStart = 0.0
-  # Network debug panel (dev): F6 toggles the overlay, F7 cycles the
-  # network-condition simulator (off/local/good/poor/extreme). F9/F10
-  # stay MENU/TEAM. Auto-open when --netsim already turned the sim on.
-  var netDebugPanel = netSimConfig().enabled
   var lastClipOverride = clipOverride
   pointerProbeWindow = window
+  defer:
+    window.onFrame = nil
+    window.onButtonPress = nil
+    window.onRune = nil
+    window.onFocusChange = proc() =
+      window.updateCursorConfinement()
+    window.runeInputEnabled = false
+    pointerProbeWindow = nil
+    releaseCursorConfinement()
+    stopGameAudio()
+    flushBugTapeIfArmed()
+    practiceFinish(run)
+    closeDuelLogging()
+    if not run.replayMode:
+      saveRecording()
   window.onFrame = proc() =
-    # Start/stop Fluffy before profileBlock "frame". startTrace clears
-    # the span stack; a matching measurePop of a skipped push is IndexDefect.
-    if window.buttonPressed[KeyF2] and not chatTyping():
-      discard handleChromeKey(KeyF2)
+    if not chatTyping() and not bindingCapture and not pudgeBindingCapture():
+      if window.actionPressed(TraceInput):
+        toggleRuntimeTrace()
+      if window.actionPressed(DebugInput):
+        chrome.debugMenuOpen = not chrome.debugMenuOpen
+      if window.actionPressed(MenuInput):
+        toggleMatchMenu()
+      if window.actionPressed(FullscreenInput):
+        window.setFullscreen(not window.isFullscreen)
     profileBlock "frame":
       let dt = frameDelta(lastFrameTime, Step)
       if clipOverride != lastClipOverride:
@@ -2287,8 +2383,9 @@ proc runGraphics*() =
         lastClipOverride = clipOverride
       if clipOverride != ClipOverrideOff:
         clipOverrideTime += dt
-      hostLobbyOpen = netLobbyOpen
-      if window.buttonPressed[KeyLeftBracket]:
+      when not defined(emscripten):
+        window.updateWindowSettings()
+      if window.buttonPressed[KeyLeftBracket] and not chatTyping() and not menuIsOpen():
         toggleTransportBar()
       updateTouchHud(window)
       sk.uiScale = hudUiScale(window)
@@ -2296,183 +2393,110 @@ proc runGraphics*() =
       worldViewRect = worldPixelPanel(window)
       let playAspect = worldViewRect.aspect
       tickGameAudio()
-      if window.buttonPressed[bindKey(BindMute)]:
-        toggleGameAudioMute()
-      if window.buttonPressed[KeyF3]:
-        toggleDebugMenu()
-      if window.buttonPressed[KeyP] and not chatTyping():
-        practiceToggle()
-      if window.buttonPressed[KeyF8]:
-        toggleBugRecording()
-      if netRole == NetClient:
-        if window.buttonPressed[KeyF6]:
-          netDebugPanel = not netDebugPanel
-        if window.buttonPressed[KeyF7]:
-          netSimAdvanceCycle()
-          netDebugPanel = true
+      if not menuIsOpen() and not chatTyping():
+        if window.buttonPressed[bindKey(BindMute)]:
+          toggleGameAudioMute()
+        if window.buttonPressed[KeyF3]:
+          toggleDebugMenu()
+        if window.buttonPressed[KeyP]:
+          practiceToggle()
+        if window.buttonPressed[KeyF8]:
+          toggleBugRecording()
+        if network == nil and not run.replayMode and matchResultsVisible() and
+            window.buttonPressed[bindKey(BindRematch)]:
+          applyMatchMenu(Rematch)
+          return
       cameraDistance = clampCameraDistance(cameraDistance)
-      when not defined(emscripten):
-        if netRole == NetHost:
-          pumpHosting(run)
-          if netLobbyOpen:
-            const SeatKeys = [
-              Key1, Key2, Key3, Key4, Key5, Key6, Key7, Key8, Key9, Key0
-            ]
-            let shiftHeld =
-              window.buttonDown[KeyLeftShift] or
-              window.buttonDown[KeyRightShift]
-            if not hostingStarted():
-              if window.buttonPressed[KeyMinus]:
-                if applyTeamSize(int(options.teamSize) - 1):
-                  setHostTeamSize(int(options.teamSize))
-                  rebakeArena()
-              if window.buttonPressed[KeyEqual]:
-                if applyTeamSize(int(options.teamSize) + 1):
-                  setHostTeamSize(int(options.teamSize))
-                  rebakeArena()
-            for i, key in SeatKeys:
-              if i >= hostSeatCount():
-                continue
-              if window.buttonPressed[key]:
-                if shiftHeld:
-                  # Toggle the seat for roster experiments; claimed
-                  # or host-held seats cannot be switched off.
-                  if not seatDisabled[i] and hostSeatTaken(i):
-                    discard
-                  else:
-                    seatDisabled[i] = not seatDisabled[i]
-                elif not seatDisabled[i]:
-                  hostClaimLocal(i)
-            if window.buttonPressed[Key0] and hostSeatCount() < 10:
-              hostClaimLocal(-1)
-            if window.buttonPressed[KeyEnter]:
-              startHostedMatch()
-      if netRole == NetClient:
-        let netEvents = netClientPump(run)
-        if netEvents.restarted:
-          netRematchNow(netEvents.setup)
-        localSeat = netClientSeat()
-        if transport.playing and transport.targetTick < 0:
-          # Fallen behind the live stream (slow frame, boot backlog):
-          # seek forward, which fast-forwards at catch-up speed. Jitter
-          # keeps the gap around a tick or two; a quarter second means
-          # real drift. Live-TV rule: playback chases the live edge, so
-          # pause to inspect history.
-          let received = recordedTicksNow()
-          if received - run.world.tick > TickRate div 4:
-            transport.seekTo(received)
-      if consumeMenuRestart() or (
-          run.world.gameOver and not run.replayMode and
-          netRole != NetClient and
-          window.buttonPressed[bindKey(BindRematch)]):
-        rematchNow()
+      if network != nil:
+        connection.pump()
+        if network.reopenedLobby() or network.client.snapshot.room.len == 0:
+          leaveMatch = true
+          return
+        if quitToMenu and not network.client.welcomed:
+          leaveMatch = true
+          return
+        if quitToMenu and not leaveRequested:
+          if network.client.snapshot.phase in {rooms.Ended, Desynced}:
+            network.client.send(RoomMessage(kind: LeaveRoom))
+            leaveRequested = true
+        transport.playing = not network.finished and
+          network.client.snapshot.phase == rooms.Playing
+        transport.setSpeed(0)
       updateCamera(dt)
       let recorded = recordedTicksNow()
       transport.sync(run.world.tick, recorded, run.world.gameOver)
-      let restoreTick = transport.takeRestore()
-      if restoreTick >= 0:
-        restoreTo(restoreTick)
-        transport.sync(run.world.tick, recorded, run.world.gameOver)
-      if netLobbyOpen:
-        transport.playing = false
-        chatInputEnabled = false
-        cancelChatTyping()
-      else:
-        chatInputEnabled = true
-      if netRole == NetClient:
-        run.humanPaced = netHumanPaced()
-      elif netRole == NetOff and not run.replayMode and
-          (humanControlActive() or run.humanSlots.len > 0):
-        run.humanPaced = true
-      let liveHumanPace = run.humanPaced and not run.replayMode and
-        (netRole == NetClient or not transport.inHistory)
-      let clockRate = wallTickRate(liveHumanPace)
-      if (netRole == NetClient or not transport.inHistory) and not run.replayMode and
-          (humanControlActive() or run.humanSlots.len > 0 or
-            netRole != NetOff):
-        # Keep the transport multiplier at 1; the host clock supplies the
-        # human slowdown. Faster speeds are for bot-only spectating;
-        # seeking still catches back up to the live tick at full speed.
-        transport.setSpeed(0)
-      transport.startFrame(dt, clockRate)
-      if not netLobbyOpen and not menuIsOpen() and not chatTyping():
-        # Replay and live spectators get the same LMB pass: click a
-        # butcher to lock fog to their eyes. A seated human still
-        # issues commands through the rest of handleHumanInput.
-        let
-          inputProjection =
-            perspective(45.0'f32, playAspect, 0.1'f32, 1000.0'f32)
+      if network == nil:
+        let restoreTick = transport.takeRestore()
+        if restoreTick >= 0:
+          restoreTo(restoreTick)
+          transport.sync(run.world.tick, recorded, run.world.gameOver)
+        if not run.replayMode and
+            (humanControlActive() or run.humanSlots.len > 0):
+          run.humanPaced = true
+          if not transport.inHistory:
+            transport.setSpeed(0)
+      let clockRate =
+        if network != nil: NetworkTickRate
+        else: wallTickRate(run.humanPaced and not run.replayMode and
+          not transport.inHistory)
+      if not menuIsOpen() and not chatTyping():
+        # Replay and live spectators use this pass to select a fog perspective.
+        let inputProjection =
+          perspective(45.0'f32, playAspect, 0.1'f32, 1000.0'f32)
         handleHumanInput(
           window,
           inputProjection * cameraView(),
           mouseOverUi(window, sk.mousePos),
-          # A follower always trails the stream by a tick or two, so
-          # "history" cannot mean "cannot command" there: intents land
-          # at the host's live tick regardless.
-          not transport.inHistory or netRole == NetClient,
+          not transport.inHistory and not matchResultsVisible() and
+            (network == nil or network.client.snapshot.phase == rooms.Playing),
           cameraTarget,
           followSelection,
           rightClickCommand and not window.buttonDown[bindKey(BindPan)],
           window.buttonDown[bindKey(BindPan)],
           panTap
         )
-      else:
-        # Chat / menu skip the WASD poll. Stop so the last KeyA dest
-        # does not keep walking west after the keyboard is stolen.
+      elif network == nil or network.client.snapshot.phase == rooms.Playing:
         releaseKeyboardSteer()
       let frameStart = epochTime()
-      if fpsPrevStart > 0:
-        let fdt = frameStart - fpsPrevStart
-        if fdt > 0:
-          fpsSmoothed = fpsSmoothed * 0.9'f32 + float32(1.0 / fdt) * 0.1'f32
-      fpsPrevStart = frameStart
-      run.historyPlayback = transport.inHistory or netRole == NetClient
       profileBlock "simulate":
-        while transport.shouldTick(frameStart):
-          if atLiveTickCap(
-              run.world.tick, transport.durationTicks, transport.live):
-            break
-          if netRole == NetClient and
-              run.world.tick >= recordedTicksNow():
-            # A follower never simulates a tick the host has not
-            # finished; the accumulator keeps what the stream owes.
-            break
-          run.historyPlayback = transport.inHistory or
-            netRole == NetClient
-          advanceRenderedSimulation()
-          transport.sync(
-            run.world.tick, recordedTicksNow(), run.world.gameOver
-          )
-      when not defined(emscripten):
-        if netRole == NetHost:
-          hostBroadcastTicks(run)
-          hostForwardResults(run, localSeat)
-      when defined(emscripten):
-        profileBlock "predict":
-          # Rebuild the prediction world from the freshly-advanced confirmed
-          # world: replay this seat's unconfirmed local intents and run a
-          # few ticks ahead, so the local butcher and camera respond before
-          # the host echoes the command back. Followers only; the confirmed
-          # `run` world stays the hash-verified authority (never ticked
-          # here). Rollback happens inside `rebuild`.
-          if netRole == NetClient and netClientSeat() >= 0 and
-              not run.world.gameOver:
-            # Size the lead for the worst-case RTT (ping + jitter), so a
-            # jittery link keeps a stable lead instead of bouncing frame to
-            # frame — fewer timing-miss snaps.
-            let lead = leadFromRttMs(netPingMs() + netPingJitterMs(), clockRate)
-            if not predictor.enabled or predictor.seat != netClientSeat():
-              predictor.enable(netClientSeat(), lead)
-            else:
-              predictor.lead = lead
-            predictor.rebuild(run)
-          else:
-            predictor.disable()
-      if netRole == NetClient and run.hashCheck.mismatches > 0:
-        netReportDesync(run.hashCheck.firstTick)
+        if network == nil:
+          transport.startFrame(dt, int32(clockRate))
+          run.historyPlayback = transport.inHistory
+          while transport.shouldTick(frameStart):
+            if atLiveTickCap(
+                run.world.tick, transport.durationTicks, transport.live):
+              break
+            run.historyPlayback = transport.inHistory
+            advanceRenderedSimulation()
+            transport.sync(run.world.tick, recordedTicksNow(), run.world.gameOver)
+        else:
+          run.historyPlayback = false
+          if not quitToMenu and network.client.snapshot.phase != Desynced:
+            try:
+              network.flushSubmissions()
+              var packet: RoomMessage
+              while not network.finished and connection.takeTick(packet, int(clockRate)):
+                advanceRenderedSimulation(packet)
+                inc connection.stats.playedTicks
+                lastAppliedAt = networkTime()
+                if epochTime() - frameStart > 0.012:
+                  break
+            except RoomsError as error:
+              network.abort(error.msg)
+          connection.pump()
+          transport.sync(run.world.tick, run.world.tick, run.world.gameOver)
       let active = simulationActive(transport)
-      if active:
-        renderAlpha = clamp(transport.accumulator * clockRate.float32, 0.0'f32, 1.0'f32)
+      if active and network != nil:
+        let now = networkTime()
+        let elapsed =
+          if lastAppliedAt < 0: 0.0
+          elif connection.stats.smoothPlayback and connection.playback.started:
+            connection.playback.elapsed(now, int(clockRate))
+          else: now - lastAppliedAt
+        renderAlpha = clamp(elapsed * clockRate.float64, 0.0, 1.0).float32
+        animationAlpha = renderAlpha
+      elif active:
+        renderAlpha = clamp(transport.accumulator * clockRate.float32, 0.0'f, 1.0'f)
         animationAlpha = renderAlpha
       else:
         renderAlpha = 1
@@ -2493,10 +2517,7 @@ proc runGraphics*() =
         if not scene.sunDepthPass:
           knifeRenderer.clear()
         for pudgeIndex in 0 ..< run.world.pudges.len:
-          # The local WASM seat renders from the prediction world; all
-          # other butchers and every non-predicting build render the
-          # confirmed world (an unchanged copy).
-          let pudge = predictedPudge(pudgeIndex)
+          let pudge = run.world.pudges[pudgeIndex]
           if not fogShownPudge(pudge) or pudge.justBlinked:
             continue
           let
@@ -2518,6 +2539,7 @@ proc runGraphics*() =
               of ClipOverrideAttack: pudgeMeleeClips[pudge.team]
               of ClipOverrideDeath: pudgeClips[pudge.team][deathClip]
               of ClipOverrideVictory: pudgeClips[pudge.team][victoryClip]
+            facing = unitFacing(pudge.id, pudge.facing)
             pos = unitPoint(pudge.id, pudge.position)
           var drawn = pos
           drawn.y = surfaceHeightNear(pos.x, pos.z, pos.y)
@@ -2533,16 +2555,17 @@ proc runGraphics*() =
             scene,
             model,
             drawn,
-            unitFacing(pudge.id, pudge.facing),
+            facing,
             clip,
             animSeconds,
             butcherTint(pudgeIndex(run.world, pudge.id), pudge)
           )
           if not scene.sunDepthPass:
             let
-              facing = unitFacing(pudge.id, pudge.facing)
-              leftHand = model.characterJointTransform("L_Hand", drawn, facing)
-              rightHand = model.characterJointTransform("R_Hand", drawn, facing)
+              sockets = handSockets[pudge.team]
+              raised = translate(drawn + vec3(0, 2, 0))
+              leftHand = if sockets[0] != nil: sockets[0].mat else: raised
+              rightHand = if sockets[1] != nil: sockets[1].mat else: raised
               wrap = if pudge.team == WestTeam: rgbx(160,62,46,254)
                 else: rgbx(47,100,153,254)
               heldRadius = block:
@@ -2594,9 +2617,7 @@ proc runGraphics*() =
         setEnvironmentPalette(scene.toon)
         profileBlock "shadows":
           sunDepthPasses(window.size):
-            if sunDepthTerrainDirty:
-              drawTerrainSunDepth()
-              commitSunTerrain()
+            drawTerrainSunDepth()
             scene.sunDepthPass = true
             drawButchers()
             scene.sunDepthPass = false
@@ -2605,266 +2626,263 @@ proc runGraphics*() =
         applyPlayViewport()
         profileBlock "vision":
           updateTerrainVision()
-        drawTerrain(viewProjection, showTiles)
-      profilePush("worldDraw")
-      beginCharacters(scene, window, view, projection, cameraEye)
-      applyPlayViewport()
-      drawButchers()
-      finishCharacters(scene)
-      knifeRenderer.draw(viewProjection, opaque=true)
-      drawWater(
-        viewProjection,
-        cameraEye,
-        unitTime(int32(run.world.tick))
-      )
+        drawTerrain(viewProjection, ui.showTiles or chrome.showTiles)
+      profileBlock "world draw":
+        beginCharacters(scene, window, view, projection, cameraEye)
+        applyPlayViewport()
+        drawButchers()
+        finishCharacters(scene)
+        knifeRenderer.draw(viewProjection, opaque = true)
+        glUseProgram(waterShaderProgram())
+        glUniform1f(lavaTime, unitTime(run.world.tick))
+        drawWater(viewProjection, cameraEye)
 
-      shapeRenderer.clear()
-      shapeRenderer.addLavaBoil(unitTime(int32(run.world.tick)))
-      shapeRenderer.addDebugMapOverlays()
-      for pudge in run.world.pudges:
-        if pudge.hookedBy == 0 or pudge.state == Dying:
-          continue
-        if not fogShownPudge(pudge):
-          continue
-        var glow = unitPoint(pudge.id, pudge.position)
-        glow.y = surfaceHeightNear(glow.x, glow.z, glow.y) + 0.22'f32
-        shapeRenderer.addCircle(glow, GrabGlowRadius, GrabGlow, 14)
-      let rotR = RotRadius.float32 / WorldScale.float32
-      let rotSeconds = unitTime(int32(run.world.tick))
-      let fireR = RuneLightningTrailRadius.float32 / WorldScale.float32
-      let fireLife = max(RuneLightningTrailDurationTicks.float32, 1.0'f32)
-      for patch in run.world.firePatches:
-        var stain = renderPoint(patch.position)
-        stain.y = surfaceHeightNear(stain.x, stain.z, stain.y) + 0.14'f32
-        shapeRenderer.addFireStain(
-          stain,
-          fireR,
-          patch.ticksLeft.float32 / fireLife,
-          rotSeconds + patch.position.x.float32 * 0.00001'f32
-        )
-      for i in 0 ..< run.world.pudges.len:
-        let pudge = predictedPudge(i)
-        if pudge.state == Dying or not fogShownPudge(pudge):
-          continue
-        var feet = unitPoint(pudge.id, pudge.position)
-        feet.y = surfaceHeightNear(feet.x, feet.z, feet.y) + 0.16'f32
-        if pudge.shieldTicks > 0:
-          let remain =
-            pudge.shieldTicks.float32 / max(SpawnShieldTicks.float32, 1.0'f32)
-          shapeRenderer.addSpawnShield(feet, remain, rotSeconds)
-        if pudge.rotOn:
-          shapeRenderer.addRotCloud(feet, rotR, rotPulse(pudge), rotSeconds)
-        if pudge.rotOn or run.world.rotAffected(pudge):
-          let sickPulse = 0.5'f32 + 0.5'f32 * sin(
-            rotSeconds * TAU.float32 * 2.0'f32 + pudge.id.float32 * 0.7'f32
+        shapeRenderer.clear()
+        shapeRenderer.addLavaBoil(unitTime(int32(run.world.tick)))
+        shapeRenderer.addDebugMapOverlays()
+        for pudge in run.world.pudges:
+          if pudge.hookedBy == 0 or pudge.state == Dying:
+            continue
+          if not fogShownPudge(pudge):
+            continue
+          var glow = unitPoint(pudge.id, pudge.position)
+          glow.y = surfaceHeightNear(glow.x, glow.z, glow.y) + 0.22'f32
+          shapeRenderer.addCircle(glow, GrabGlowRadius, GrabGlow, 14)
+        let rotR = RotRadius.float32 / WorldScale.float32
+        let rotSeconds = unitTime(int32(run.world.tick))
+        let fireR = RuneLightningTrailRadius.float32 / WorldScale.float32
+        let fireLife = max(RuneLightningTrailDurationTicks.float32, 1.0'f32)
+        for patch in run.world.firePatches:
+          var stain = renderPoint(patch.position)
+          stain.y = surfaceHeightNear(stain.x, stain.z, stain.y) + 0.14'f32
+          shapeRenderer.addFireStain(
+            stain,
+            fireR,
+            patch.ticksLeft.float32 / fireLife,
+            rotSeconds + patch.position.x.float32 * 0.00001'f32
           )
-          shapeRenderer.addCircle(
-            feet,
-            1.28'f32 + sickPulse * 0.42'f32,
-            fadeRgbx(RotSick, 58.0'f32 + sickPulse * 42.0'f32),
-            14
-          )
-      if run.world.lightningTick > 0:
-        let age = int32(run.world.tick) - run.world.lightningTick
-        if age >= 0 and age <= TickRate div 3:
+        for i in 0 ..< run.world.pudges.len:
+          let pudge = run.world.pudges[i]
+          if pudge.state == Dying or not fogShownPudge(pudge):
+            continue
+          var feet = unitPoint(pudge.id, pudge.position)
+          feet.y = surfaceHeightNear(feet.x, feet.z, feet.y) + 0.16'f32
+          if pudge.shieldTicks > 0:
+            let remain =
+              pudge.shieldTicks.float32 / max(SpawnShieldTicks.float32, 1.0'f32)
+            shapeRenderer.addSpawnShield(feet, remain, rotSeconds)
+          if pudge.rotOn:
+            shapeRenderer.addRotCloud(feet, rotR, rotPulse(pudge), rotSeconds)
+          if pudge.rotOn or run.world.rotAffected(pudge):
+            let sickPulse = 0.5'f32 + 0.5'f32 * sin(
+              rotSeconds * TAU.float32 * 2.0'f32 + pudge.id.float32 * 0.7'f32
+            )
+            shapeRenderer.addCircle(
+              feet,
+              1.28'f32 + sickPulse * 0.42'f32,
+              fadeRgbx(RotSick, 58.0'f32 + sickPulse * 42.0'f32),
+              14
+            )
+        if run.world.lightningTick > 0:
+          let age = int32(run.world.tick) - run.world.lightningTick
+          if age >= 0 and age <= TickRate div 3:
+            let
+              boltR = RuneLightningRadius.float32 / WorldScale.float32
+              fade = 1.0'f32 - age.float32 / (TickRate div 3).float32
+              pulse = 0.85'f32 + 0.15'f32 * (1.0'f32 - fade)
+            var bolt = renderPoint(run.world.lightningPoint)
+            bolt.y = surfaceHeightNear(bolt.x, bolt.z, bolt.y) + 0.20'f32
+            shapeRenderer.addCircle(
+              bolt, boltR * pulse, fadeRgbx(LightningRing, 90.0'f32 * fade), 22
+            )
+            shapeRenderer.addCircle(
+              bolt, boltR * 0.22'f32 * pulse,
+              fadeRgbx(LightningFlash, 160.0'f32 * fade),
+              14
+            )
+        block:
+          let now = epochTime()
+          var kept: seq[BlinkResidue]
+          for residue in blinkResidues:
+            let age = now - residue.born
+            if age < 0 or age >= BlinkResidueSeconds:
+              continue
+            kept.add residue
+            if not fogCanSee(residue.worldOrigin):
+              continue
+            let
+              fade = 1.0'f32 - float32(age / BlinkResidueSeconds)
+              grow = float32(age / BlinkResidueSeconds)
+              radius = 2.4'f32 + grow * 2.6'f32
+            var ground = residue.origin
+            ground.y = surfaceHeightNear(ground.x, ground.z, ground.y) + 0.18'f32
+            shapeRenderer.addCircle(
+              ground,
+              radius,
+              rgbx(BlinkPuff.r, BlinkPuff.g, BlinkPuff.b, uint8(fade * 100)),
+              18
+            )
+            shapeRenderer.addCircle(
+              ground,
+              radius * 0.42'f32,
+              rgbx(
+                BlinkPuffCore.r, BlinkPuffCore.g, BlinkPuffCore.b,
+                uint8(fade * 140)
+              ),
+              14
+            )
+            var chest = residue.origin
+            chest.y = surfaceHeightNear(chest.x, chest.z, chest.y) + 1.55'f32
+            shapeRenderer.addCircle(
+              chest,
+              1.15'f32 + fade * 0.55'f32,
+              rgbx(BlinkPuff.r, BlinkPuff.g, BlinkPuff.b, uint8(fade * 70)),
+              12
+            )
+          blinkResidues = kept
+        hookRenderer.clear()
+        for hook in run.world.hooks:
+          if hook.phase == HookIdle:
+            continue
+          let owner = pudgeIndex(run.world, hook.ownerId)
+          if owner < 0:
+            continue
+          var chain: seq[Vec3]
           let
-            boltR = RuneLightningRadius.float32 / WorldScale.float32
-            fade = 1.0'f32 - age.float32 / (TickRate div 3).float32
-            pulse = 0.85'f32 + 0.15'f32 * (1.0'f32 - fade)
-          var bolt = renderPoint(run.world.lightningPoint)
-          bolt.y = surfaceHeightNear(bolt.x, bolt.z, bolt.y) + 0.20'f32
-          shapeRenderer.addCircle(
-            bolt, boltR * pulse, fadeRgbx(LightningRing, 90.0'f32 * fade), 22
-          )
-          shapeRenderer.addCircle(
-            bolt, boltR * 0.22'f32 * pulse,
-            fadeRgbx(LightningFlash, 160.0'f32 * fade),
-            14
-          )
-      block:
-        let now = epochTime()
-        var kept: seq[BlinkResidue]
-        for residue in blinkResidues:
-          let age = now - residue.born
-          if age < 0 or age >= BlinkResidueSeconds:
-            continue
-          kept.add residue
-          if not fogCanSee(residue.worldOrigin):
+            ownerPudge = run.world.pudges[owner]
+            hasHand = ownerPudge.id in chainHands and fogShownPudge(ownerPudge)
+            hand = if hasHand: chainHands[ownerPudge.id]
+              else: unitPoint(ownerPudge.id,ownerPudge.position)
+          chain.add hand
+          for bounce in hook.bounces:
+            chain.add renderPoint(bounce)
+          let head = hookPoint(hook.id, hook.position)
+          chain.add head
+          let
+            seconds = unitTime(int32(run.world.tick))
+            teamColor = if hook.team == WestTeam: WestHook else: EastHook
+            headRadius = hook.radius.float32 / WorldScale.float32
+          for fragment in clipChainToFog(chain):
+            if fragment.len == 0:
+              continue
+            let dx = fragment[^1].x - head.x
+            let dz = fragment[^1].z - head.z
+            hookRenderer.drawMeatHook(
+              fragment,
+              hook.heading,
+              hook.phase == HookFlying,
+              hook.victimId != 0,
+              teamColor,
+              seconds + hook.id.float32 * 0.73'f32,
+              headRadius,
+              showHead = dx * dx + dz * dz < 0.08'f32,
+              charged = hook.lightning,
+              attachHand = hasHand and lengthSq(fragment[0]-chain[0]) < 0.08'f32,
+              handOrigin = hand
+            )
+        for rune in run.world.runes:
+          if not fogCanSee(rune.position):
             continue
           let
-            fade = 1.0'f32 - float32(age / BlinkResidueSeconds)
-            grow = float32(age / BlinkResidueSeconds)
-            radius = 2.4'f32 + grow * 2.6'f32
-          var ground = residue.origin
-          ground.y = surfaceHeightNear(ground.x, ground.z, ground.y) + 0.18'f32
-          shapeRenderer.addCircle(
-            ground,
-            radius,
-            rgbx(BlinkPuff.r, BlinkPuff.g, BlinkPuff.b, uint8(fade * 100)),
-            18
+            seconds = unitTime(int32(run.world.tick))
+            phase = rune.id.float32 * 0.83'f32
+          var center = runePoint(rune.id, rune.position)
+          let waterY = surfaceHeightNear(center.x, center.z, center.y)
+          center.y = waterY + RuneHover +
+            sin(seconds * RuneBobRate + phase) * RuneBobAmp
+          shapeRenderer.addRiverRune(
+            center, waterY, seconds * RuneSpinRate + phase, rune.kind
           )
-          shapeRenderer.addCircle(
-            ground,
-            radius * 0.42'f32,
-            rgbx(
-              BlinkPuffCore.r, BlinkPuffCore.g, BlinkPuffCore.b,
-              uint8(fade * 140)
-            ),
-            14
-          )
-          var chest = residue.origin
-          chest.y = surfaceHeightNear(chest.x, chest.z, chest.y) + 1.55'f32
-          shapeRenderer.addCircle(
-            chest,
-            1.15'f32 + fade * 0.55'f32,
-            rgbx(BlinkPuff.r, BlinkPuff.g, BlinkPuff.b, uint8(fade * 70)),
-            12
-          )
-        blinkResidues = kept
-      hookRenderer.clear()
-      for hook in run.world.hooks:
-        if hook.phase == HookIdle:
-          continue
-        let owner = pudgeIndex(run.world, hook.ownerId)
-        if owner < 0:
-          continue
-        var chain: seq[Vec3]
-        let
-          ownerPudge = run.world.pudges[owner]
-          hasHand = ownerPudge.id in chainHands and fogShownPudge(ownerPudge)
-          hand = if hasHand: chainHands[ownerPudge.id]
-            else: unitPoint(ownerPudge.id,ownerPudge.position)
-        chain.add hand
-        for bounce in hook.bounces:
-          chain.add renderPoint(bounce)
-        let head = hookPoint(hook.id, hook.position)
-        chain.add head
-        let
-          seconds = unitTime(int32(run.world.tick))
-          teamColor = if hook.team == WestTeam: WestHook else: EastHook
-          headRadius = hook.radius.float32 / WorldScale.float32
-        for fragment in clipChainToFog(chain):
-          if fragment.len == 0:
+        let viewTeam = fogTeam()
+        for prop in run.world.props:
+          if not prop.alive:
             continue
-          let dx = fragment[^1].x - head.x
-          let dz = fragment[^1].z - head.z
-          hookRenderer.drawMeatHook(
-            fragment,
-            hook.heading,
-            hook.phase == HookFlying,
-            hook.victimId != 0,
-            teamColor,
-            seconds + hook.id.float32 * 0.73'f32,
-            headRadius,
-            showHead = dx * dx + dz * dz < 0.08'f32,
-            charged = hook.lightning,
-            attachHand = hasHand and lengthSq(fragment[0]-chain[0]) < 0.08'f32,
-            handOrigin = hand
-          )
-      for rune in run.world.runes:
-        if not fogCanSee(rune.position):
-          continue
-        let
-          seconds = unitTime(int32(run.world.tick))
-          phase = rune.id.float32 * 0.83'f32
-        var center = runePoint(rune.id, rune.position)
-        let waterY = surfaceHeightNear(center.x, center.z, center.y)
-        center.y = waterY + RuneHover +
-          sin(seconds * RuneBobRate + phase) * RuneBobAmp
-        shapeRenderer.addRiverRune(
-          center, waterY, seconds * RuneSpinRate + phase, rune.kind
+          if viewTeam >= 0 and not propVisibleTo(prop, Team(viewTeam)):
+            continue
+          if prop.kind == PropWall and not fogCanSee(prop.propCenter):
+            continue
+          var base = tileCenterRender(int(prop.tileX), int(prop.tileZ))
+          base.y = surfaceHeightNear(base.x, base.z, 0)
+          if prop.kind == PropWall:
+            var wood = base
+            wood.y += 0.85'f32
+            shapeRenderer.addAxisBox(
+              wood, 0.42'f32, 0.85'f32, 0.18'f32, PalisadeWood
+            )
+            var band = wood
+            band.y += 0.12'f32
+            shapeRenderer.addAxisBox(
+              band, 0.46'f32, 0.10'f32, 0.22'f32, PalisadeBand
+            )
+            var cap = base
+            cap.y += 1.72'f32
+            shapeRenderer.addAxisBox(
+              cap, 0.44'f32, 0.06'f32, 0.20'f32, PalisadeTop
+            )
+          elif prop.kind == PropWard:
+            var mark = base
+            mark.y += 0.08'f32
+            shapeRenderer.addObserverWard(mark)
+          else:
+            var mark = base
+            mark.y += 0.08'f32
+            shapeRenderer.addLandMine(mark)
+        shapeRenderer.addShopOverlays()
+        shapeRenderer.drawHumanOverlays(
+          window, viewProjection, barRight, barUp
         )
-      let viewTeam = fogTeam()
-      for prop in run.world.props:
-        if not prop.alive:
-          continue
-        if viewTeam >= 0 and not propVisibleTo(prop, Team(viewTeam)):
-          continue
-        if prop.kind == PropWall and not fogCanSee(prop.propCenter):
-          continue
-        var base = tileCenterRender(int(prop.tileX), int(prop.tileZ))
-        base.y = surfaceHeightNear(base.x, base.z, 0)
-        if prop.kind == PropWall:
-          var wood = base
-          wood.y += 0.85'f32
-          shapeRenderer.addAxisBox(
-            wood, 0.42'f32, 0.85'f32, 0.18'f32, PalisadeWood
-          )
-          var band = wood
-          band.y += 0.12'f32
-          shapeRenderer.addAxisBox(
-            band, 0.46'f32, 0.10'f32, 0.22'f32, PalisadeBand
-          )
-          var cap = base
-          cap.y += 1.72'f32
-          shapeRenderer.addAxisBox(
-            cap, 0.44'f32, 0.06'f32, 0.20'f32, PalisadeTop
-          )
-        elif prop.kind == PropWard:
-          var mark = base
-          mark.y += 0.08'f32
-          shapeRenderer.addObserverWard(mark)
-        else:
-          var mark = base
-          mark.y += 0.08'f32
-          shapeRenderer.addLandMine(mark)
-      shapeRenderer.addShopOverlays()
-      shapeRenderer.drawHumanOverlays(
-        window, viewProjection, barRight, barUp
-      )
-      shapeRenderer.addDebugCollisionOverlays()
-      shapeRenderer.draw(viewProjection)
-      hookRenderer.draw(viewProjection, opaque=true)
+        shapeRenderer.addDebugCollisionOverlays()
+        shapeRenderer.draw(viewProjection)
+        hookRenderer.draw(viewProjection, opaque = true)
 
-      particles.drawParticles(
-        viewProjection, barRight, barUp, cameraForward
-      )
-      worldBarRenderer.clear()
-      for pudge in run.world.pudges:
-        if pudge.state == Dying or pudge.justBlinked or not fogShownPudge(pudge):
-          continue
-        var pos = unitPoint(pudge.id, pudge.position)
-        pos.y = surfaceHeightNear(pos.x, pos.z, pos.y) + ButcherBarLift
-        worldBarRenderer.addResourceBars(
-          pos,
-          ButcherBarWidth,
-          [
-            WorldResourceBar(
-              value: max(pudge.hp, 0).float32,
-              maximum: max(pudge.maxHp, 1).float32,
-              delayedValue: max(pudge.hp, 0).float32,
-              height: 0.12'f32,
-              color: pudgeHpColor(pudge),
-              showDamageTrail: true
-            )
-          ]
+        particles.drawParticles(
+          viewProjection, barRight, barUp, cameraForward
         )
-      let barViewTeam = fogTeam()
-      for prop in run.world.props:
-        if not prop.alive or prop.kind != PropWall:
-          continue
-        if not fogCanSee(prop.propCenter):
-          continue
-        if barViewTeam >= 0 and not propVisibleTo(prop, Team(barViewTeam)):
-          continue
-        var barPos = tileCenterRender(int(prop.tileX), int(prop.tileZ))
-        barPos.y = surfaceHeightNear(barPos.x, barPos.z, 0) + PalisadeBarLift
-        worldBarRenderer.addResourceBars(
-          barPos,
-          PalisadeBarWidth,
-          [
-            WorldResourceBar(
-              value: max(prop.hp, 0).float32,
-              maximum: max(prop.maxHp, 1).float32,
-              delayedValue: max(prop.hp, 0).float32,
-              height: 0.08'f32,
-              color: PalisadeWood,
-              showDamageTrail: true
-            )
-          ]
-        )
-      worldBarRenderer.draw(viewProjection, barRight, barUp)
-      profilePop()
+        worldBarRenderer.clear()
+        for pudge in run.world.pudges:
+          if pudge.state == Dying or pudge.justBlinked or not fogShownPudge(pudge):
+            continue
+          var pos = unitPoint(pudge.id, pudge.position)
+          pos.y = surfaceHeightNear(pos.x, pos.z, pos.y) + ButcherBarLift
+          worldBarRenderer.addResourceBars(
+            pos,
+            ButcherBarWidth,
+            [
+              WorldResourceBar(
+                value: max(pudge.hp, 0).float32,
+                maximum: max(pudge.maxHp, 1).float32,
+                delayedValue: max(pudge.hp, 0).float32,
+                height: 0.12'f32,
+                color: pudgeHpColor(pudge),
+                showDamageTrail: true
+              )
+            ]
+          )
+        let barViewTeam = fogTeam()
+        for prop in run.world.props:
+          if not prop.alive or prop.kind != PropWall:
+            continue
+          if not fogCanSee(prop.propCenter):
+            continue
+          if barViewTeam >= 0 and not propVisibleTo(prop, Team(barViewTeam)):
+            continue
+          var barPos = tileCenterRender(int(prop.tileX), int(prop.tileZ))
+          barPos.y = surfaceHeightNear(barPos.x, barPos.z, 0) + PalisadeBarLift
+          worldBarRenderer.addResourceBars(
+            barPos,
+            PalisadeBarWidth,
+            [
+              WorldResourceBar(
+                value: max(prop.hp, 0).float32,
+                maximum: max(prop.maxHp, 1).float32,
+                delayedValue: max(prop.hp, 0).float32,
+                height: 0.08'f32,
+                color: PalisadeWood,
+                showDamageTrail: true
+              )
+            ]
+          )
+        worldBarRenderer.draw(viewProjection, barRight, barUp)
 
       let captureHud =
         when defined(takeScreenshot): getEnv("SCREENSHOT_HUD") == "1"
@@ -2878,295 +2896,171 @@ proc runGraphics*() =
             "examples/pudge_wars/pw_shot.png"
           )
         profileBlock "present":
-          window.present(framePaceHz)
+          window.presentFrame(framePaceHz)
         return
-      profilePush("ui")
-      glDisable(GL_DEPTH_TEST)
-      glDisable(GL_CULL_FACE)
-      glDisable(GL_BLEND)
-      glViewport(0, 0, window.size.x.GLsizei, window.size.y.GLsizei)
-      when not defined(emscripten):
-        glDisable(GL_MULTISAMPLE)
-      glActiveTexture(GL_TEXTURE0)
-      glBindTexture(GL_TEXTURE_2D, sk.atlasTextureId())
-      sk.beginUi(window, window.size)
-      # Silky has no z-index: later draw calls win. Strict back → front:
-      # world-space 2D, HUD chrome (inside drawUi), then modal overlays
-      # (also inside drawUi), then net lobby / banner on top.
-      block:
-        # Rising combat numbers, anchored to the world through the HUD.
-        let now = epochTime()
-        var kept: seq[FloatingText]
-        for text in floatingTexts:
-          let age = now - text.born
-          if age > 0.9:
-            continue
-          kept.add text
-          let
-            lifted = text.world +
-              vec3(0, 3.2'f32 + float32(age) * 2.4'f32, 0)
-            screen = screenPoint(lifted, viewProjection) / sk.uiScale
-            fade = uint8(clamp(255.0 - age / 0.9 * 255.0, 0.0, 255.0))
-          sk.drawLabel(
-            text.text,
-            screen - vec2(44, 9),
-            vec2(88, 18),
-            rgbx(text.color.r, text.color.g, text.color.b, fade),
-            "Hud",
-            CenterAlign
-          )
-        floatingTexts = kept
-      block:
-        # Nameplates: small shadowed type over the HP bar, no plate.
-        let spectateSlot = spectateIndex()
-        for slot in 0 ..< run.world.pudges.len:
-          let pudge = predictedPudge(slot)
-          if pudge.state == Dying or pudge.justBlinked:
-            continue
-          if not run.replayMode and not fogShownPudge(pudge):
-            continue
-          var label = butcherDisplayName(slot)
-          if label.len == 0:
-            label = "P" & $pudge.id
-          if pudge.shieldTicks > 0:
-            label = "SHIELD  " & label
-          if slot == spectateSlot:
-            label = "EYES  " & label
-          var anchor = unitPoint(pudge.id, pudge.position)
-          anchor.y = surfaceHeightNear(anchor.x, anchor.z, anchor.y) +
-            NamePlateLift
-          let screen = screenPoint(anchor, viewProjection) / sk.uiScale
-          if screen.x < -4000:
-            continue
-          let
-            layoutW = window.size.x.float32 / max(sk.uiScale, 0.001'f32)
-            plate = vec2(
-              min(NamePlateW, max(layoutW * 0.46'f32, 96)),
-              NamePlateH
-            )
-            origin = screen - plate * 0.5'f32
-            textColor =
-              if pudge.shieldTicks > 0: SpawnShieldName
-              elif slot == spectateSlot: NamePlateEyes
-              else: NamePlateText
-          sk.drawLabel(
-            label, origin + vec2(1, 1), plate, NamePlateShadow, "Small",
-            CenterAlign
-          )
-          sk.drawLabel(
-            label, origin, plate, textColor, "Small", CenterAlign
-          )
-      block:
-        # Team pings: a screen-space ! so the mark stays readable at any
-        # zoom, stacked on the world-space billboard.
-        for marker in pingMarkers():
-          var anchor = tileCenterRender(int(marker.tileX), int(marker.tileZ))
-          anchor.y = surfaceHeightNear(anchor.x, anchor.z, 0) + 1.85'f32
-          let
-            bounce =
-              if marker.age < 0.7:
-                8.0'f32 * sin(float32(marker.age) * 14.0'f32) *
-                  (1.0'f32 - float32(marker.age) / 0.7'f32)
-              else:
-                0.0'f32
-            screen = screenPoint(anchor, viewProjection) / sk.uiScale -
-              vec2(0, bounce)
-            fade = uint8(clamp(
-              255.0 * (1.0 - marker.age / PingOverlaySeconds), 0.0, 255.0
-            ))
-            plate = vec2(36, 48)
-            origin = screen - plate * 0.5'f32
-          if screen.x < -4000:
-            continue
-          sk.drawLabel(
-            "!", origin + vec2(1, 1), plate,
-            rgbx(40, 24, 8, fade), "H1", CenterAlign
-          )
-          sk.drawLabel(
-            "!", origin, plate,
-            rgbx(PingGold.r, PingGold.g, PingGold.b, fade),
-            "H1", CenterAlign
-          )
-      block:
-        let pick = groundUnderMouse(window, viewProjection)
-        debugHoverFound = pick.found
-        if pick.found:
-          let tile = tileOfGround(pick.point)
-          debugHoverX = int(tile.x)
-          debugHoverZ = int(tile.y)
-      if showTiles:
-        let labelColor = rgbx(236, 232, 210, 220)
-        for z in countup(PlayZMin, PlayZMax, DebugTileLabelStep):
-          for x in countup(PlayWestMin, PlayEastMax, DebugTileLabelStep):
-            let
-              world = liftPoint(tileCenterRender(x, z), 0.4'f32)
-              screen = screenPoint(world, viewProjection) / sk.uiScale
-            if screen.x < -40 or screen.y < -20 or
-                screen.x > window.size.x.float32 / sk.uiScale + 40:
-              continue
-            hudScratch.setLen(0)
-            hudScratch.addHudInt(x)
-            hudScratch.add ','
-            hudScratch.addHudInt(z)
-            sk.drawLabel(
-              hudScratch,
-              screen - vec2(22, 7),
-              vec2(44, 14),
-              labelColor,
-              "Small",
-              CenterAlign
-            )
-        if debugHoverFound:
-          let
-            world = liftPoint(
-              tileCenterRender(debugHoverX, debugHoverZ), 0.55'f32
-            )
-            screen = screenPoint(world, viewProjection) / sk.uiScale
-          hudScratch.setLen(0)
-          hudScratch.addHudInt(debugHoverX)
-          hudScratch.add ','
-          hudScratch.addHudInt(debugHoverZ)
-          sk.drawLabel(
-            hudScratch,
-            screen - vec2(36, 10),
-            vec2(72, 18),
-            rgbx(255, 230, 120, 255),
-            "Hud",
-            CenterAlign
-          )
-      drawUi(
-        sk,
-        window,
-        transport,
-        cameraTarget,
-        cameraDistance,
-        actionCam,
-        followSelection,
-        cameraEye
-      )
-      # IME only while the chat draft has focus. Left on during play,
-      # macOS's accent popup on held A swallows the key-up and the
-      # butcher walks west until A is tapped again.
-      window.runeInputEnabled = chatTyping()
-      when not defined(emscripten):
-        if netLobbyOpen:
-          sk.drawNetLobby(
-            window, hostSeatRoster(), hostingUrl(), localClaim
-          )
-      if netRole == NetClient:
-        sk.drawNetBanner(window, netStatusLine())
-        let fpsNow = int(fpsSmoothed + 0.5'f32)
-        let screenH = window.size.y.float32 / sk.uiScale
-        if netDebugPanel:
-          # Full developer panel: configured vs measured latency, jitter,
-          # loss, per-direction packet counters, queue depth, the constant
-          # sim tick rate (decoupled from latency), and a rolling ping graph.
-          let nc = netSimConfig()
-          let so = netSimStats(DirOutbound)
-          let si = netSimStats(DirInbound)
-          const PanelW = 272.0'f32
-          const PanelH = 142.0'f32
-          let px = 8.0'f32
-          let py = screenH - PanelH - 6
-          sk.drawRect(vec2(px, py), vec2(PanelW, PanelH), rgbx(20, 22, 28, 205))
-          let txt = rgbx(236, 232, 210, 235)
-          var ly = py + 5
-          template row(s: string) =
-            sk.drawLabel(s, vec2(px + 8, ly), vec2(PanelW - 16, 14), txt,
-              "Hud", LeftAlign)
-            ly += 15
-          hudScratch.setLen(0)
-          hudScratch.add(if nc.enabled: "NETSIM " else: "NETSIM off ")
-          if nc.enabled:
-            hudScratch.add netSimLabel()
-            hudScratch.add "  cfg "
-          else:
-            hudScratch.add "cfg "
-          hudScratch.addHudInt(nc.latencyMs)
-          hudScratch.add "+/-"
-          hudScratch.addHudInt(nc.jitterMs)
-          hudScratch.add "ms loss "
-          hudScratch.addHudInt(int(nc.packetLossPercent + 0.5))
-          hudScratch.add "%"
-          row(hudScratch)
-          hudScratch.setLen(0)
-          hudScratch.add "ping "
-          if netPingKnown(): hudScratch.addHudInt(netPingMs())
-          else: hudScratch.add "--"
-          hudScratch.add "ms jit "
-          hudScratch.addHudInt(netPingJitterMs())
-          hudScratch.add "  sim "
-          hudScratch.addHudInt(int(clockRate))
-          hudScratch.add "Hz fps "
-          hudScratch.addHudInt(fpsNow)
-          row(hudScratch)
-          hudScratch.setLen(0)
-          when defined(emscripten):
-            if predictor.enabled:
-              hudScratch.add "pred lead "
-              hudScratch.addHudInt(predictor.lead)
-              hudScratch.add "/"
-              hudScratch.addHudInt(int(MaxLead))
-              hudScratch.add " pend "
-              hudScratch.addHudInt(predictor.pending.len)
-              hudScratch.add " snap "
-              hudScratch.addHudInt(predictor.snapCount)
-            else:
-              hudScratch.add "pred idle"
-          else:
-            hudScratch.add "pred off (use browser)"
-          row(hudScratch)
-          hudScratch.setLen(0)
-          hudScratch.add "out snt "
-          hudScratch.addHudInt(so.offered)
-          hudScratch.add " dly "
-          hudScratch.addHudInt(so.delayed)
-          hudScratch.add " drp "
-          hudScratch.addHudInt(so.dropped)
-          hudScratch.add " q "
-          hudScratch.addHudInt(so.queueDepth)
-          row(hudScratch)
-          hudScratch.setLen(0)
-          hudScratch.add "in  rcv "
-          hudScratch.addHudInt(si.offered)
-          hudScratch.add " dly "
-          hudScratch.addHudInt(si.delayed)
-          hudScratch.add " drp "
-          hudScratch.addHudInt(si.dropped)
-          hudScratch.add " q "
-          hudScratch.addHudInt(si.queueDepth)
-          row(hudScratch)
-          # Rolling ping graph.
-          let hist = netPingHistory()
-          let gx = px + 8
-          let gy = ly + 2
-          const Gh = 26.0'f32
-          let gw = PanelW - 16
-          sk.drawRect(vec2(gx, gy), vec2(gw, Gh), rgbx(40, 44, 52, 190))
-          if hist.len > 0:
-            var mx = 1
-            for v in hist: mx = max(mx, v)
-            let bw = gw / float32(PingHistoryCap)
-            for i in 0 ..< hist.len:
-              let h = Gh * clamp(float32(hist[i]) / float32(mx), 0.03'f32, 1.0'f32)
-              sk.drawRect(
-                vec2(gx + float32(i) * bw, gy + Gh - h),
-                vec2(max(bw - 1.0'f32, 1.0'f32), h),
-                rgbx(120, 200, 140, 220))
-          sk.drawLabel("F6 panel  F7 preset  F3 sliders", vec2(gx, gy + Gh + 1),
-            vec2(gw, 12), rgbx(150, 150, 150, 200), "Hud", LeftAlign)
+      profileBlock "ui":
+        glDisable(GL_DEPTH_TEST)
+        glDisable(GL_CULL_FACE)
+        glDisable(GL_BLEND)
+        glViewport(0, 0, window.size.x.GLsizei, window.size.y.GLsizei)
+        when not defined(emscripten):
+          glDisable(GL_MULTISAMPLE)
+        glActiveTexture(GL_TEXTURE0)
+        glBindTexture(GL_TEXTURE_2D, sk.atlasTextureId())
+        if menuIsOpen():
+          applyMatchMenu(sk.drawMatchMenu(window, transport, preferences, quitToMenu))
+          window.updateCursorConfinement(preferences.edgeScrolling)
         else:
-          # Compact readout: host round-trip ping (ms) and render FPS.
-          hudScratch.setLen(0)
-          hudScratch.add "PING "
-          if netPingKnown(): hudScratch.addHudInt(netPingMs())
-          else: hudScratch.add "--"
-          hudScratch.add "ms  FPS "
-          hudScratch.addHudInt(fpsNow)
-          sk.drawLabel(hudScratch, vec2(10, screenH - 24), vec2(220, 18),
-            rgbx(236, 232, 210, 220), "Hud", LeftAlign)
-      sk.endUi()
-      profilePop()
+          sk.beginUi(window, window.size)
+          # Draw world-space labels before the HUD so menus can cover them.
+          block:
+            # Rising combat numbers, anchored to the world through the HUD.
+            let now = epochTime()
+            var kept: seq[FloatingText]
+            for text in floatingTexts:
+              let age = now - text.born
+              if age > 0.9:
+                continue
+              kept.add text
+              let
+                lifted = text.world +
+                  vec3(0, 3.2'f32 + float32(age) * 2.4'f32, 0)
+                screen = screenPoint(lifted, viewProjection) / sk.uiScale
+                fade = uint8(clamp(255.0 - age / 0.9 * 255.0, 0.0, 255.0))
+              sk.drawLabel(
+                text.text,
+                screen - vec2(44, 9),
+                vec2(88, 18),
+                rgbx(text.color.r, text.color.g, text.color.b, fade),
+                "Hud",
+                CenterAlign
+              )
+            floatingTexts = kept
+          block:
+            # Nameplates: small shadowed type over the HP bar, no plate.
+            let spectateSlot = spectateIndex()
+            for slot in 0 ..< run.world.pudges.len:
+              let pudge = run.world.pudges[slot]
+              if pudge.state == Dying or pudge.justBlinked:
+                continue
+              if not run.replayMode and not fogShownPudge(pudge):
+                continue
+              var label = butcherDisplayName(slot)
+              if label.len == 0:
+                label = "P" & $pudge.id
+              if pudge.shieldTicks > 0:
+                label = "SHIELD  " & label
+              if slot == spectateSlot:
+                label = "EYES  " & label
+              var anchor = unitPoint(pudge.id, pudge.position)
+              anchor.y = surfaceHeightNear(anchor.x, anchor.z, anchor.y) +
+                NamePlateLift
+              let screen = screenPoint(anchor, viewProjection) / sk.uiScale
+              if screen.x < -4000:
+                continue
+              let
+                layoutW = window.size.x.float32 / max(sk.uiScale, 0.001'f32)
+                plate = vec2(
+                  min(NamePlateW, max(layoutW * 0.46'f32, 96)),
+                  NamePlateH
+                )
+                origin = screen - plate * 0.5'f32
+                textColor =
+                  if pudge.shieldTicks > 0: SpawnShieldName
+                  elif slot == spectateSlot: NamePlateEyes
+                  else: NamePlateText
+              sk.drawLabel(
+                label, origin + vec2(1, 1), plate, NamePlateShadow, "Small",
+                CenterAlign
+              )
+              sk.drawLabel(
+                label, origin, plate, textColor, "Small", CenterAlign
+              )
+          block:
+            # Team pings: a screen-space ! so the mark stays readable at any
+            # zoom, stacked on the world-space billboard.
+            for marker in pingMarkers():
+              var anchor = tileCenterRender(int(marker.tileX), int(marker.tileZ))
+              anchor.y = surfaceHeightNear(anchor.x, anchor.z, 0) + 1.85'f32
+              let
+                bounce =
+                  if marker.age < 0.7:
+                    8.0'f32 * sin(float32(marker.age) * 14.0'f32) *
+                      (1.0'f32 - float32(marker.age) / 0.7'f32)
+                  else:
+                    0.0'f32
+                screen = screenPoint(anchor, viewProjection) / sk.uiScale -
+                  vec2(0, bounce)
+                fade = uint8(clamp(
+                  255.0 * (1.0 - marker.age / PingOverlaySeconds), 0.0, 255.0
+                ))
+                plate = vec2(36, 48)
+                origin = screen - plate * 0.5'f32
+              if screen.x < -4000:
+                continue
+              sk.drawLabel(
+                "!", origin + vec2(1, 1), plate,
+                rgbx(40, 24, 8, fade), "H1", CenterAlign
+              )
+              sk.drawLabel(
+                "!", origin, plate,
+                rgbx(PingGold.r, PingGold.g, PingGold.b, fade),
+                "H1", CenterAlign
+              )
+          block:
+            let pick = groundUnderMouse(window, viewProjection)
+            debugHoverFound = pick.found
+            if pick.found:
+              let tile = tileOfGround(pick.point)
+              debugHoverX = int(tile.x)
+              debugHoverZ = int(tile.y)
+          if ui.showTiles:
+            let labelColor = rgbx(236, 232, 210, 220)
+            for z in countup(PlayZMin, PlayZMax, DebugTileLabelStep):
+              for x in countup(PlayWestMin, PlayEastMax, DebugTileLabelStep):
+                let
+                  world = liftPoint(tileCenterRender(x, z), 0.4'f32)
+                  screen = screenPoint(world, viewProjection) / sk.uiScale
+                if screen.x < -40 or screen.y < -20 or
+                    screen.x > window.size.x.float32 / sk.uiScale + 40:
+                  continue
+                hudScratch.setLen(0)
+                hudScratch.addHudInt(x)
+                hudScratch.add ','
+                hudScratch.addHudInt(z)
+                sk.drawLabel(
+                  hudScratch,
+                  screen - vec2(22, 7),
+                  vec2(44, 14),
+                  labelColor,
+                  "Small",
+                  CenterAlign
+                )
+            if debugHoverFound:
+              let
+                world = liftPoint(
+                  tileCenterRender(debugHoverX, debugHoverZ), 0.55'f32
+                )
+                screen = screenPoint(world, viewProjection) / sk.uiScale
+              hudScratch.setLen(0)
+              hudScratch.addHudInt(debugHoverX)
+              hudScratch.add ','
+              hudScratch.addHudInt(debugHoverZ)
+              sk.drawLabel(
+                hudScratch,
+                screen - vec2(36, 10),
+                vec2(72, 18),
+                rgbx(255, 230, 120, 255),
+                "Hud",
+                CenterAlign
+              )
+          let action = drawUi(
+            sk, window, transport, cameraTarget, cameraDistance, actionCam,
+            followSelection, cameraEye
+          )
+          sk.endUi()
+          window.runeInputEnabled = chatTyping() and window.focused
+          applyMatchMenu(action)
       when defined(takeScreenshot):
         captureScreenshot(
           window,
@@ -3175,24 +3069,41 @@ proc runGraphics*() =
           "examples/pudge_wars/pw_shot.png"
         )
       profileBlock "present":
-        window.present(framePaceHz)
+        window.presentFrame(framePaceHz)
+        reportReplayFrame(run.world.tick, int32(run.hashCheck.mismatches))
+      when defined(emscripten):
+        if not notifiedPresentation:
+          notifiedPresentation = true
+          {.emit: """
+          EM_ASM({
+            if (window.pwPresentationReady) window.pwPresentationReady();
+          });
+          """.}
     if noteProfileFrame():
       when not defined(emscripten):
         window.closeRequested = true
 
-  while not window.closeRequested:
-    pollEvents()
+  window.onButtonPress = proc(button: Button) =
+    ## Shares cursor confinement and display shortcuts with the frontend.
+    window.captureCursorConfinement(button)
+    if not chatTyping() and not pudgeBindingCapture():
+      discard window.scaleKey(button, preferences, sk.uiScale, PudgeAppName)
 
-  when not defined(emscripten):
-    if netRole == NetHost:
-      stopHosting("the host closed the game")
-  if netRole == NetClient:
-    netShutdown()
-  flushBugTapeIfArmed()
-  practiceFinish(run)
-  closeDuelLogging()
-  if not run.replayMode:
-    saveRecording()
-  closeGameAudio()
-  particles.closeParticles()
-  finishProfileTrace()
+  window.onRune = proc(rune: unicode.Rune) =
+    ## Routes text to arena chat when a settings widget has no active field.
+    if not menuIsOpen():
+      addChatRune(rune)
+
+  window.onFocusChange = proc() =
+    ## Gives up text input and sound when the arena loses focus.
+    window.updateCursorConfinement()
+    if not window.focused:
+      stopGameAudio()
+      cancelChatTyping()
+      window.runeInputEnabled = false
+
+  while not window.closeRequested and not leaveMatch:
+    pollEvents()
+    waitForDisplay()
+
+  result = quitToMenu

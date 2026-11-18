@@ -4,14 +4,11 @@ import
   std/[json, os, strformat, strutils, times, unicode],
   chroma, pixie, silky, vmath, windy,
   polyworld/[
-    actioncam, bottomhud, chrome, commandcard, gameuis, hudchips, pathing,
-    player, profiles, rtscameras
+    actioncam, chrome, connections, gameuis, lobbies, menus, pathing, player,
+    rtscameras
   ],
-  content, maps, netproto, netclient, netsim, netpredict, sim, game, human,
-  keybinds, practice, replays
-
-when not defined(emscripten):
-  import hosting
+  pudgewars/[bottomhud, commandcard, hudchips],
+  content, game, human, keybinds, maps, multiplayer, practice, replays, sim
 
 const
   PanelRoster = vec2(380, 300)
@@ -64,26 +61,8 @@ const
   ChipMenu = 0
   ChipTeam = 1
   ChipLog = 2
-  ChipReplay = 3
-  ChipDebug = 4
   ChipDirector = 5
   ChipFollow = 6
-  MenuResume = 0
-  MenuRestart = 1
-  MenuControls = 2
-  MenuAllies = 3
-  MenuLog = 4
-  MenuReplay = 5
-  MenuDebug = 6
-  MenuItemCount = 7
-  MenuButtonH = 38.0'f32
-  MenuButtonGap = 10.0'f32
-  MenuPanelSize = vec2(400, 490)
-  ControlsPanelSize = vec2(440, 360)
-  ControlsBack = 0
-  ControlsQuickcast = 1
-  ControlsAutocast = 2
-  ControlsItemCount = 3
   CmdMove = 0
   CmdStop = 1
   CmdHold = 2
@@ -116,7 +95,7 @@ const
     ## Fit small windows without enlarging panels to fill large ones.
     ## Display density is applied separately so Retina text stays crisp.
   RunePillH = 28.0'f32
-  DebugWindowTitle = "Debug"
+  DebugWindowTitle = "Arena debug"
   DebugWindowOrigin = vec2(16, 40)
   DebugWindowSize = vec2(336, 1000)
   BakedZoomInDistance* = 75.0'f32
@@ -139,6 +118,9 @@ const
   SpectatorAllW = 90.0'f32
 
 type
+  MatchMenuAction* = enum
+    StayInMatch, ToggleMatchPause, ReturnToLobby, QuitToHome, Rematch
+
   HudChrome = object
     layout: GameUiLayout
     west: GameUiPanel
@@ -180,15 +162,15 @@ var
   killStinger: KillStinger
   alliesOpen = false
   menuOpen = false
-  controlsOpen = false
+  settingsOpen = false
   chatVisible = false
   chatTab = ChatTabChat
   chatComposing = false
   chatDraft = ""
-  chatInputEnabled* = true
   eventLog: seq[EventLogEntry]
-  menuCursor = 0
-  menuRestartRequested = false
+  matchConnection: Connection
+  matchNetwork: NetworkMatch
+  localPlayerName: string
   debugMenuOpen* = false
   showTiles* = false
   showLayers* = false
@@ -209,16 +191,13 @@ var
   clipOverrideTime* = 0.0'f32
   showTransportBar = true
     ## Play/pause/speed strip. On for simulations and replays; `[` toggles.
-  hostLobbyOpen* = false
-    ## True while the host's pre-match lobby overlay is up. The strip
-    ## stays hidden then so the lobby plate is not sitting on a scrubber.
   bugTapeArmed* = false
     ## F3 / F8: Stop will flush a named copy of the live match tape.
   bugTapeFromTick* = 0'i32
   bugTapeLastPath* = ""
 
 proc menuIsOpen*(): bool =
-  ## True while the F9 pause plate is up.
+  ## Reports whether the match menu or settings is open.
   menuOpen
 
 proc chatTyping*(): bool =
@@ -239,14 +218,32 @@ proc toggleDebugMenu*() =
     # First open shows something at once instead of a bare panel.
     showCollision = true
 
-proc consumeMenuRestart*(): bool =
-  ## True once after Restart Game; the frame loop rebuilds the match.
-  result = menuRestartRequested
-  menuRestartRequested = false
+proc toggleMatchMenu*() =
+  ## Opens the arena menu or goes back one level.
+  if settingsOpen:
+    settingsOpen = false
+  else:
+    menuOpen = not menuOpen
+  if menuOpen:
+    cancelAim()
+  cancelChatTyping()
+
+proc configureMatchUi*(network: NetworkMatch, connection: Connection,
+    name = "") =
+  ## Resets modal and presentation state before a different match.
+  matchNetwork = network
+  matchConnection = connection
+  localPlayerName = name
+  menuOpen = false
+  settingsOpen = false
+  alliesOpen = false
+  chatVisible = false
+  chatTab = ChatTabChat
+  cancelChatTyping()
 
 proc bugTapePlayerName(): string =
-  let name = netPlayerName()
-  if name.len > 0: name else: "human"
+  ## Picks a player name for the match tape's filename.
+  if localPlayerName.len > 0: localPlayerName else: "human"
 
 proc bugTapePudgeId(): int32 =
   if localSeat >= 0 and localSeat < run.world.pudges.len:
@@ -272,10 +269,7 @@ proc startBugRecording*(): bool =
     setHumanError("CANNOT RECORD A PLAYBACK")
     return false
   if run.recorder == nil:
-    if netRole == NetClient:
-      setHumanError("THE HOST HOLDS THE TAPE")
-    else:
-      setHumanError("START THE MATCH FIRST")
+    setHumanError("START THE MATCH FIRST")
     return false
   bugTapeArmed = true
   bugTapeFromTick = run.world.tick
@@ -342,18 +336,13 @@ proc flushBugTapeIfArmed*() =
     discard stopBugRecording()
   bugTapeArmed = false
 
-proc menuCanRestart(): bool =
-  not run.replayMode and netRole != NetClient
-
 proc transportBarOpen*(): bool =
-  ## Replay controls belong to recordings and local bot spectating.
-  ## A live human seat (including a network spectator) cannot scrub time.
-  showTransportBar and not hostLobbyOpen and run != nil and
-    (run.replayMode or (not humanControlActive() and netRole != NetClient))
+  ## Exposes playback controls for recordings and local bot spectating.
+  showTransportBar and run != nil and
+    (run.replayMode or (matchNetwork == nil and not humanControlActive()))
 
 proc toggleTransportBar*() =
-  if hostLobbyOpen:
-    return
+  ## Toggles the replay transport strip.
   showTransportBar = not showTransportBar
 
 proc pushKillFeed*(text: string, team: Team) =
@@ -410,22 +399,26 @@ proc resetMatchRecap*() =
   lastStateEast = -1
   lastStateTick = -32
 
+proc matchResultsVisible*(): bool =
+  ## Reports completion, interruption, or the local live time limit.
+  if matchNetwork != nil:
+    let client = matchNetwork.client
+    return matchNetwork.finished or client.snapshot.phase == Desynced or
+      (client.snapshot.phase == rooms.Ended and client.applied >= client.serverTick)
+  run.world.gameOver or
+    (not run.replayMode and run.world.tick >= run.maximumTicks)
+
 proc matchPhaseName(): string =
-  if run.world.gameOver:
-    return "over"
-  if netRole == NetClient:
-    case netClientPhase()
-    of NcLobby, NcOffline:
-      return "joining"
-    of NcDropped, NcDesynced:
+  ## Reports the live match phase through the browser host bridge.
+  if matchResultsVisible():
+    if matchNetwork != nil and matchNetwork.client.snapshot.phase == Desynced:
       return "dropped"
-    of NcReconnecting:
+    return "over"
+  if matchNetwork != nil:
+    if not matchNetwork.client.welcomed:
       return "reconnecting"
-    of NcFinished:
-      if run.world.tick >= int32(run.replayPlayer.data.hashes.len):
-        return "over"
-    of NcPlaying:
-      discard
+    if matchNetwork.client.snapshot.phase == Waiting:
+      return "waiting"
   if run.world.tick <= 0:
     return "starting"
   "live"
@@ -533,7 +526,7 @@ proc placeChrome(layout: GameUiLayout): HudChrome =
   )
 
 proc hudLayoutFits(layoutSize: Vec2): bool =
-  let layout = initGameUiLayout(layoutSize, 0, 10, 0)
+  let layout = initGameUiLayout(layoutSize, 0, 10)
   layout.size.x >= BottomHudMinWidth and
     layout.gameAreaSize.y >= BottomHudMinGameHeight
 
@@ -579,7 +572,8 @@ proc updateTouchHud*(window: Window) =
 
 proc hudUiScale*(window: Window): float32 =
   let density = max(window.contentScale, 1.0'f32)
-  hudUiScale(vec2(window.size.x.float32, window.size.y.float32) / density) * density
+  let automatic = hudUiScale(window.size.vec2 / density) * density
+  selectedUiScale(automatic, density)
 
 var pointerProbeWindow*: Window
   ## The game window, for touch-input.js's HUD hit test.
@@ -600,18 +594,16 @@ when defined(emscripten):
     cint(mouseOverUi(window, px / hudUiScale(window)))
 
 proc currentLayout*(window: Window): GameUiLayout =
-  initGameUiLayout(
-    vec2(window.size.x.float32, window.size.y.float32) /
-      hudUiScale(window),
-    0,
-    10,
-    0
-  )
+  initGameUiLayout(window.size.vec2 / hudUiScale(window))
 
 proc worldPixelPanel*(window: Window): GameUiPanel =
   ## 3D play rectangle in window pixels: the whole window. Widgets
   ## float over the world instead of reserving strips of it.
-  currentLayout(window).worldPanel.scaled(hudUiScale(window))
+  GameUiPanel(size: window.size.vec2)
+
+proc aspect*(panel: GameUiPanel): float32 =
+  ## Keeps camera projection finite while a window is resizing.
+  max(panel.size.x, 1.0'f) / max(panel.size.y, 1.0'f)
 
 proc mouseOverDebugMenu(mouse: Vec2): bool =
   ## Returns whether the pointer is over the F3 debug window.
@@ -694,16 +686,9 @@ proc butcherDisplayName*(index: int): string =
   ## Name plate for one roster seat: lobby name, bot personality, or P<id>.
   if run == nil or index < 0 or index >= run.world.pudges.len:
     return ""
-  let
-    pudge = run.world.pudges[index]
-    seat = int(pudge.lobbySeat)
-  if netRole == NetClient:
-    result = netSeatName(seat)
-  when not defined(emscripten):
-    if result.len == 0 and netRole == NetHost:
-      result = hostSeatName(seat)
-  if result.len == 0 and index == localSeat:
-    result = netPlayerName()
+  let pudge = run.world.pudges[index]
+  if matchNetwork == nil and index == localSeat:
+    result = localPlayerName
   if result.len == 0 and index < run.seatLabels.len:
     result = run.seatLabels[index]
   if result.len == 0:
@@ -756,13 +741,16 @@ proc mouseOverUi*(window: Window, mouse: Vec2): bool =
   ## clicks. Everywhere else the full-screen world stays clickable.
   if mouseOverDebugMenu(mouse):
     return true
-  if mouseOverFpsDebugger(mouse):
+  if chrome.mouseOverDebugMenu(mouse):
     return true
   if menuOpen:
     return true
   let
     layout = currentLayout(window)
     chrome = placeChrome(layout)
+  if matchResultsVisible() and
+      layout.panel(GameUiRegion.Center, PanelEndScreen).contains(mouse):
+    return true
   if spectatorChromeVisible() and spectatorBannerPanel(layout).contains(mouse):
     return true
   if heroWantsShop() and shopPanelOf(layout).contains(mouse):
@@ -778,7 +766,7 @@ proc mouseOverUi*(window: Window, mouse: Vec2): bool =
   if alliesOpen and
       (chrome.west.contains(mouse) or chrome.east.contains(mouse)):
     return true
-  chatVisible and chatPanelOf(layout).contains(mouse)
+  (chatVisible or chatComposing) and chatPanelOf(layout).contains(mouse)
 
 proc minimapArea(window: Window): GameUiPanel =
   ## Circular map well inside the bottom-right compass plate.
@@ -997,7 +985,7 @@ proc drawMinimap(
       ring = i == heroSlot or i == spectateSlot or pudge.shieldTicks > 0
     )
 
-  let aspect = currentLayout(window).worldPanel.aspect
+  let aspect = worldPixelPanel(window).aspect
   sk.drawCameraFrame(
     minimapViewport(
       cameraTarget, cameraDistance, aspect,
@@ -1142,19 +1130,27 @@ proc drawKillStinger(sk: Silky, layout: GameUiLayout) =
       CenterAlign
     )
 
-proc drawEndScreen(sk: Silky, window: Window, layout: GameUiLayout) =
+proc drawEndScreen(sk: Silky, layout: GameUiLayout): MatchMenuAction =
   ## Victory or defeat plate with the match stat recap.
-  publishMatchRecap()
+  if run.world.gameOver:
+    publishMatchRecap()
   let
     panel = layout.panel(GameUiRegion.Center, PanelEndScreen)
     winner = run.world.winner
     inner = sk.beginPanel(
       panel,
-      if winner == WestTeam: WestColor else: EastColor
+      if not run.world.gameOver: ReadyGold
+      elif winner == WestTeam: WestColor
+      else: EastColor
     )
   hudScratch.setLen(0)
   let heroSlot = if humanControlActive(): heroIndex() else: -1
-  if heroSlot >= 0:
+  if not run.world.gameOver:
+    hudScratch.add(
+      if run.world.tick >= run.maximumTicks: "TIME LIMIT REACHED"
+      else: "MATCH INTERRUPTED"
+    )
+  elif heroSlot >= 0:
     if run.world.pudges[heroSlot].team == winner:
       hudScratch.add "VICTORY"
     else:
@@ -1205,74 +1201,34 @@ proc drawEndScreen(sk: Silky, window: Window, layout: GameUiLayout) =
       "Small"
     )
     y += 22
+  let actionY = inner.size.y - 44
+  if run.replayMode:
+    sk.drawLabel(
+      "Rewind the transport to replay the match",
+      inner.origin + vec2(0, actionY),
+      vec2(inner.size.x, 34), LabelColor, "Small", CenterAlign
+    )
+    return
+  let
+    showStats = defined(emscripten) and run.world.gameOver
+    count = if showStats: 3 else: 2
+    width = (inner.size.x - 12 * (count - 1).float32) / count.float32
+  let left = inner.origin + vec2(0, actionY)
+  let right = left + vec2((count - 1).float32 * (width + 12), 0)
+  if matchNetwork != nil:
+    let client = matchNetwork.client
+    if sk.lobbyButton(
+        "Return to lobby", left, width, height = 34,
+        enabled = client.snapshot.phase in {rooms.Ended, Desynced, Lobby}):
+      return ReturnToLobby
+  elif sk.lobbyButton("Rematch", left, width, height = 34):
+    return Rematch
   when defined(emscripten):
-    sk.drawLabel(
-      if run.replayMode:
-        "match recap - rewind the transport to relive it"
-      else:
-        "view stats on the site, or leave this arena",
-      inner.origin + vec2(0, inner.size.y - 64),
-      vec2(inner.size.x, 18),
-      LabelColor,
-      "Small",
-      CenterAlign
-    )
-    if not run.replayMode:
-      let statsBtn = GameUiPanel(
-        origin: inner.origin + vec2(0, inner.size.y - 42),
-        size: vec2((inner.size.x - 12) * 0.5'f32, 34)
-      )
-      let leaveBtn = GameUiPanel(
-        origin: inner.origin + vec2(statsBtn.size.x + 12, inner.size.y - 42),
-        size: vec2(inner.size.x - statsBtn.size.x - 12, 34)
-      )
-      let statsHover = statsBtn.contains(sk.mousePos)
-      let leaveHover = leaveBtn.contains(sk.mousePos)
-      sk.drawEtched(
-        statsBtn.origin,
-        statsBtn.size,
-        if statsHover: HudChipActive else: HudChipFill
-      )
-      sk.drawEtched(
-        leaveBtn.origin,
-        leaveBtn.size,
-        if leaveHover: HudChipActive else: HudChipFill
-      )
-      sk.drawLabel(
-        "VIEW STATS",
-        statsBtn.origin,
-        statsBtn.size,
-        if statsHover: ReadyGold else: LabelColor,
-        "Hud",
-        CenterAlign
-      )
-      sk.drawLabel(
-        "BACK TO SITE",
-        leaveBtn.origin,
-        leaveBtn.size,
-        if leaveHover: ReadyGold else: LabelColor,
-        "Hud",
-        CenterAlign
-      )
-      if window.clicked(sk, statsBtn):
-        echo "pw-nav:recap"
-      elif window.clicked(sk, leaveBtn):
-        echo "pw-nav:home"
-  else:
-    sk.drawLabel(
-      if run.replayMode:
-        "match recap - rewind the transport to relive it"
-      elif netRole == NetClient:
-        "the host picks the rematch - stay connected"
-      else:
-        "R - rematch    rewind the transport to relive it",
-      inner.origin + vec2(0, inner.size.y - 20),
-      vec2(inner.size.x, 18),
-      LabelColor,
-      "Small",
-      CenterAlign
-    )
-    discard window
+    if showStats and
+        sk.lobbyButton("View stats", left + vec2(width + 12, 0), width, height = 34):
+      echo "pw-nav:recap"
+  if sk.lobbyButton("Main menu", right, width, height = 34):
+    return QuitToHome
 
 proc drawRoster(
     sk: Silky,
@@ -2089,396 +2045,105 @@ proc drawShopPanel(sk: Silky, window: Window, layout: GameUiLayout) =
       lines
     )
 
-proc drawNetBanner*(sk: Silky, window: Window, text: string) =
-  ## One urgent center-screen line: desync, connection loss, reconnect.
-  if text.len == 0:
+proc matchCanControl*(): bool =
+  ## Only a relay participant who owns a seat can pause or end a live match.
+  if matchNetwork == nil:
+    return true
+  let client = matchNetwork.client
+  for seat in client.snapshot.seats:
+    if client.participant != 0 and seat.owner == client.participant:
+      return true
+
+proc drawMatchMenu*(sk: Silky, window: Window, transport: Player,
+    preferences: var Preferences, leaving: bool): MatchMenuAction =
+  ## Draws shared settings and match lifecycle actions over the arena.
+  if settingsOpen:
+    let origin = sk.beginOverlay(window, vec2(768, 488)) + vec2(24)
+    if sk.pudgeSettingsPanel(
+        window, preferences, origin, options.quickcast, options.autocast):
+      settingsOpen = false
+    sk.endUi()
     return
-  let reconnecting = text.startsWith("RECONNECT")
-  let layout = currentLayout(window)
-  sk.drawRect(
-    vec2(0, layout.size.y * 0.30'f32 - 8),
-    vec2(layout.size.x, 46),
-    if reconnecting: rgbx(20, 18, 8, 200) else: rgbx(20, 8, 10, 200)
-  )
-  sk.drawLabel(
-    text,
-    vec2(0, layout.size.y * 0.30'f32),
-    vec2(layout.size.x, 30),
-    if reconnecting: rgbx(255, 214, 120, 255) else: rgbx(245, 80, 85, 255),
-    "H1",
-    CenterAlign
-  )
-
-proc drawNetLobby*(
-    sk: Silky,
-    window: Window,
-    seats: seq[NetSeat],
-    url: string,
-    localClaim: int
-) =
-  ## The host's pre-match lobby overlay: who joined, where friends
-  ## point their browsers, and the start controls.
+  window.runeInputEnabled = false
   let
-    layout = currentLayout(window)
-    panel = layout.panel(
-      GameUiRegion.Center,
-      vec2(600, max(280.0'f32, 140.0'f32 + float32(seats.len) * 30.0'f32))
-    )
-  sk.drawRect(vec2(0, 0), layout.size, rgbx(6, 8, 12, 170))
-  let inner = sk.beginPanel(panel, ReadyGold)
-  sk.drawLabel(
-    "MATCH LOBBY  " & $(max(seats.len div 2, 1)) & "v" &
-      $(max(seats.len div 2, 1)),
-    inner.origin,
-    vec2(inner.size.x, 30),
-    ReadyGold,
-    "H1",
-    CenterAlign
-  )
-  sk.drawLabel(
-    "-/+ TEAM SIZE   SHIFT+1-0 TOGGLES A SEAT   FRIENDS JOIN AT",
-    inner.origin + vec2(0, 42),
-    vec2(inner.size.x, 16),
-    LabelColor,
-    "Small",
-    CenterAlign
-  )
-  sk.drawLabel(
-    url,
-    inner.origin + vec2(0, 60),
-    vec2(inner.size.x, 22),
-    rgbx(120, 200, 255, 255),
-    "Hud",
-    CenterAlign
-  )
-  let n = max(seats.len div 2, 1)
-  var y = 100.0'f32
-  for i in 0 ..< seats.len:
-    let
-      team = if i < n: WestTeam else: EastTeam
-      teamColor = if team == WestTeam: WestColor else: EastColor
-      mine = i == localClaim
-      seat =
-        if i < seats.len: seats[i]
-        else: NetSeat()
-    hudScratch.setLen(0)
-    hudScratch.add "["
-    if i >= 9:
-      hudScratch.add "0"
-    else:
-      hudScratch.addHudInt(i + 1)
-    hudScratch.add "]  "
-    hudScratch.add(if team == WestTeam: "WEST  " else: "EAST  ")
-    if seat.off:
-      hudScratch.add "SEAT OFF"
-    elif seat.human:
-      hudScratch.add seat.name
-      if not seat.connected:
-        hudScratch.add "  (away)"
-    else:
-      if seat.name.len > 0:
-        hudScratch.add seat.name
-      else:
-        hudScratch.add "Butcher Bot"
-    sk.drawLabel(
-      hudScratch,
-      inner.origin + vec2(60, y),
-      vec2(60, 18),
-      teamColor,
-      "Hud"
-    )
-    sk.drawLabel(
-      if seat.off: "OFF"
-      elif mine: "YOU"
-      elif seat.human: "HUMAN"
-      else: "BOT",
-      inner.origin + vec2(inner.size.x - 130, y),
-      vec2(70, 18),
-      if mine: ReadyGold
-      elif seat.human: rgbx(120, 220, 130, 255)
-      else: rgbx(120, 128, 144, 255),
-      "Hud",
-      RightAlign
-    )
-    y += 30
-  sk.drawLabel(
-    "1-0 TAKE A SEAT      0 SPECTATE WHEN N<5      ENTER START",
-    inner.origin + vec2(0, inner.size.y - 46),
-    vec2(inner.size.x, 18),
-    LabelColor,
-    "Hud",
-    CenterAlign
-  )
-  sk.drawLabel(
-    "browser lobby has chat - anyone with the link can join",
-    inner.origin + vec2(0, inner.size.y - 22),
-    vec2(inner.size.x, 16),
-    rgbx(150, 156, 170, 255),
-    "Small",
-    CenterAlign
-  )
-
-proc applyMenuChoice(id: int, transport: var Player) =
-  ## Runs one pause-menu row: close the plate, then resume, rematch, or
-  ## hand off to Controls / Allies / Chat / Replay / Debug.
-  case id
-  of MenuResume:
-    menuOpen = false
-    controlsOpen = false
-    transport.playing = true
-  of MenuRestart:
-    if not menuCanRestart():
-      return
-    menuOpen = false
-    controlsOpen = false
-    alliesOpen = false
-    cancelChatTyping()
-    menuRestartRequested = true
-    transport.playing = true
-  of MenuControls:
-    controlsOpen = true
-    menuCursor = 0
-  of MenuAllies:
-    menuOpen = false
-    controlsOpen = false
-    alliesOpen = true
-    transport.playing = true
-  of MenuLog:
-    menuOpen = false
-    controlsOpen = false
-    chatVisible = false
-    chatTab = ChatTabChat
-    alliesOpen = false
-    transport.playing = true
-  of MenuReplay:
-    menuOpen = false
-    controlsOpen = false
-    transport.playing = true
-    toggleTransportBar()
-  of MenuDebug:
-    menuOpen = false
-    controlsOpen = false
-    transport.playing = true
-    toggleDebugMenu()
+    size = vec2(512, 468)
+    panel = sk.beginOverlay(window, size)
+    origin = panel + vec2(24)
+    paused =
+      if matchNetwork == nil: not transport.playing
+      else: matchNetwork.client.snapshot.flag
+    ended = matchResultsVisible()
+    active = matchNetwork == nil or
+      matchNetwork.client.snapshot.phase in {rooms.Playing, Waiting}
+    canReturn = matchNetwork != nil and
+      matchNetwork.client.snapshot.phase in {rooms.Ended, Desynced, Lobby}
+  sk.lobbyPanel(panel, size)
+  if leaving:
+    sk.menuLabel("Leaving match…", origin, 464)
   else:
-    discard
+    sk.menuLabel(
+      if ended: "Match ended"
+      elif paused: "Match paused"
+      else: "Match running",
+      origin, 464
+    )
+    if sk.lobbyButton(
+        if ended: "View results" else: "Return to game",
+        origin + vec2(0, 46), 464):
+      menuOpen = false
+    if sk.lobbyButton(
+        if paused: "Resume match" else: "Pause match",
+        origin + vec2(0, 98), 464,
+        enabled = matchCanControl() and active and not ended):
+      result = ToggleMatchPause
+    if sk.lobbyButton("Settings", origin + vec2(0, 150), 464):
+      settingsOpen = true
+    if matchNetwork == nil and not run.replayMode and
+        sk.lobbyButton("Rematch", origin + vec2(0, 202), 464):
+      result = Rematch
+    elif canReturn and
+        sk.lobbyButton("Return to lobby", origin + vec2(0, 202), 464):
+      result = ReturnToLobby
+    if sk.lobbyButton("Quit to main menu", origin + vec2(0, 254), 464):
+      result = QuitToHome
+    let half = 226.0'f
+    if sk.lobbyButton("Allies", origin + vec2(0, 306), half):
+      menuOpen = false
+      alliesOpen = true
+    if sk.lobbyButton("Chat and events", origin + vec2(238, 306), half):
+      menuOpen = false
+      chatVisible = true
+    if sk.lobbyButton("Arena debug", origin + vec2(0, 358), half):
+      menuOpen = false
+      toggleDebugMenu()
+    if sk.lobbyButton(
+        if transportBarOpen(): "Hide replay controls" else: "Replay controls",
+        origin + vec2(238, 358), half,
+        enabled = run.replayMode or
+          (matchNetwork == nil and not humanControlActive())):
+      menuOpen = false
+      toggleTransportBar()
+    if matchConnection != nil and matchConnection.client.error.len > 0:
+      sk.menuLabel(matchConnection.status(), origin + vec2(0, 406), 464)
+  sk.endUi()
 
-proc drawMenuOverlay(
-    sk: Silky,
-    window: Window,
-    layout: GameUiLayout,
-    transport: var Player
-) =
-  ## Pause plate: one gold-border button per row, mouse and keyboard.
-  const
-    Labels = [
-      "Resume", "Restart Game", "Controls", "Allies", "Chat", "Replay", "Debug"
-    ]
-    NumberKeys = [Key1, Key2, Key3, Key4, Key5, Key6, Key7]
-  sk.drawRect(vec2(0, 0), layout.size, rgbx(6, 8, 12, 170))
-  let inner = sk.beginPanel(
-    layout.panel(GameUiRegion.Center, MenuPanelSize),
-    ReadyGold
-  )
-  sk.drawLabel(
-    "MENU",
-    inner.origin,
-    vec2(inner.size.x, 28),
-    ReadyGold,
-    "H1",
-    CenterAlign
-  )
-  sk.drawLabel(
-    "PAUSED",
-    inner.origin + vec2(0, 32),
-    vec2(inner.size.x, 20),
-    LabelColor,
-    "Hud",
-    CenterAlign
-  )
-  var chosen = -1
-  for i in 0 ..< MenuItemCount:
-    let
-      slot = GameUiPanel(
-        origin: inner.origin + vec2(
-          0,
-          64.0'f32 + float32(i) * (MenuButtonH + MenuButtonGap)
-        ),
-        size: vec2(inner.size.x, MenuButtonH)
-      )
-      hovered = slot.contains(sk.mousePos)
-      enabled = i != MenuRestart or menuCanRestart()
-    if hovered:
-      menuCursor = i
-    let selected = menuCursor == i
-    sk.drawEtched(
-      slot.origin,
-      slot.size,
-      if selected: HudChipActive else: HudChipFill
-    )
-    let labelColor =
-      if not enabled: rgbx(120, 128, 144, 255)
-      elif selected: ReadyGold
-      else: LabelColor
-    sk.drawLabel(
-      Labels[i],
-      slot.origin + vec2(14, 0),
-      vec2(slot.size.x - 52, slot.size.y),
-      labelColor,
-      "Hud"
-    )
-    hudScratch.setLen(0)
-    hudScratch.add '('
-    hudScratch.add $(i + 1)
-    hudScratch.add ')'
-    sk.drawLabel(
-      hudScratch,
-      slot.origin + vec2(slot.size.x - 42, 0),
-      vec2(34, slot.size.y),
-      if enabled: HudHotkey else: rgbx(96, 104, 112, 255),
-      "Small",
-      CenterAlign
-    )
-    if enabled and (window.clicked(sk, slot) or
-        window.buttonPressed[NumberKeys[i]]):
-      chosen = i
-  if window.buttonPressed[KeyUp]:
-    menuCursor = (menuCursor + MenuItemCount - 1) mod MenuItemCount
-  elif window.buttonPressed[KeyDown]:
-    menuCursor = (menuCursor + 1) mod MenuItemCount
-  if window.buttonPressed[KeyEscape]:
-    chosen = MenuResume
-  elif chosen < 0 and window.buttonPressed[KeyEnter]:
-    chosen = menuCursor
-  if chosen >= 0:
-    applyMenuChoice(chosen, transport)
-  elif menuOpen:
-    transport.playing = false
-
-proc controlToggleLabel(on: bool): string =
-  if on: "ON" else: "OFF"
-
-proc drawControlsOverlay(
-    sk: Silky,
-    window: Window,
-    layout: GameUiLayout,
-    transport: var Player
-) =
-  ## Pause-menu Controls page: quickcast and Meat Hook autocast.
-  const NumberKeys = [Key1, Key2, Key3]
-  sk.drawRect(vec2(0, 0), layout.size, rgbx(6, 8, 12, 170))
-  let inner = sk.beginPanel(
-    layout.panel(GameUiRegion.Center, ControlsPanelSize),
-    ReadyGold
-  )
-  sk.drawLabel(
-    "CONTROLS",
-    inner.origin,
-    vec2(inner.size.x, 28),
-    ReadyGold,
-    "H1",
-    CenterAlign
-  )
-  sk.drawLabel(
-    "PAUSED",
-    inner.origin + vec2(0, 32),
-    vec2(inner.size.x, 20),
-    LabelColor,
-    "Hud",
-    CenterAlign
-  )
-  let
-    labels = [
-      "Back",
-      "Quickcast",
-      "Autocast Hook"
-    ]
-    hints = [
-      "",
-      "Abilities fire at the cursor on key press.",
-      "Right-click an enemy to hook. Right-click the Hook well to toggle."
-    ]
-    values = [
-      "",
-      controlToggleLabel(options.quickcast),
-      controlToggleLabel(options.autocast)
-    ]
-  var chosen = -1
-  for i in 0 ..< ControlsItemCount:
-    let
-      slot = GameUiPanel(
-        origin: inner.origin + vec2(
-          0,
-          64.0'f32 + float32(i) * (MenuButtonH + MenuButtonGap)
-        ),
-        size: vec2(inner.size.x, MenuButtonH)
-      )
-      hovered = slot.contains(sk.mousePos)
-    if hovered:
-      menuCursor = i
-    let selected = menuCursor == i
-    sk.drawEtched(
-      slot.origin,
-      slot.size,
-      if selected: HudChipActive else: HudChipFill
-    )
-    sk.drawLabel(
-      labels[i],
-      slot.origin + vec2(14, 0),
-      vec2(slot.size.x - 110, slot.size.y),
-      if selected: ReadyGold else: LabelColor,
-      "Hud"
-    )
-    if values[i].len > 0:
-      sk.drawLabel(
-        values[i],
-        slot.origin + vec2(slot.size.x - 86, 0),
-        vec2(44, slot.size.y),
-        if values[i] == "ON": HudHotkey else: HudMuted,
-        "Hud",
-        CenterAlign
-      )
-    hudScratch.setLen(0)
-    hudScratch.add '('
-    hudScratch.add $(i + 1)
-    hudScratch.add ')'
-    sk.drawLabel(
-      hudScratch,
-      slot.origin + vec2(slot.size.x - 42, 0),
-      vec2(34, slot.size.y),
-      HudHotkey,
-      "Small",
-      CenterAlign
-    )
-    if window.clicked(sk, slot) or window.buttonPressed[NumberKeys[i]]:
-      chosen = i
-  sk.drawLabel(
-    hints[clamp(menuCursor, 0, hints.high)],
-    inner.origin + vec2(8, inner.size.y - 36),
-    vec2(inner.size.x - 16, 28),
-    rgbx(150, 156, 170, 255),
-    "Small",
-    CenterAlign
-  )
-  if window.buttonPressed[KeyUp]:
-    menuCursor = (menuCursor + ControlsItemCount - 1) mod ControlsItemCount
-  elif window.buttonPressed[KeyDown]:
-    menuCursor = (menuCursor + 1) mod ControlsItemCount
-  if window.buttonPressed[KeyEscape]:
-    chosen = ControlsBack
-  elif chosen < 0 and window.buttonPressed[KeyEnter]:
-    chosen = menuCursor
-  case chosen
-  of ControlsBack:
-    controlsOpen = false
-    menuCursor = MenuControls
-  of ControlsQuickcast:
-    options.quickcast = not options.quickcast
-  of ControlsAutocast:
-    toggleHookAutocast()
-  else:
-    discard
-  transport.playing = false
+proc drawConnectionNotice(sk: Silky, layout: GameUiLayout) =
+  ## Shows shared relay waiting, reconnect, and synchronization status.
+  if matchConnection == nil:
+    return
+  let client = matchConnection.client
+  let detail =
+    if not client.welcomed or client.error.len > 0: matchConnection.status()
+    elif client.snapshot.phase == Waiting:
+      if client.status.len > 0: client.status
+      else: "Waiting for players…"
+    elif client.snapshot.flag and not matchResultsVisible(): "Match paused"
+    else: ""
+  if detail.len > 0:
+    let width = min(layout.size.x, 540'f)
+    let at = vec2((layout.size.x - width) / 2, topCenterFloor(layout) + 34)
+    sk.lobbyPanel(at, vec2(width, 48))
+    sk.menuLabel(detail, at + vec2(12, 6), width - 24)
 
 proc chatLineColor(line: MatchChatLine): ColorRGBX =
   if line.team == int32(WestTeam.ord): WestColor
@@ -2488,8 +2153,7 @@ proc chatLineColor(line: MatchChatLine): ColorRGBX =
 proc chatSelfName(): string =
   if humanControlActive() and heroIndex() >= 0:
     return "P" & $run.world.pudges[heroIndex()].id
-  let name = netPlayerName()
-  if name.len > 0: name else: "You"
+  if localPlayerName.len > 0: localPlayerName else: "You"
 
 proc chatSelfTeam(): int32 =
   if humanControlActive() and heroIndex() >= 0:
@@ -2501,6 +2165,10 @@ proc sendChatDraft() =
   let text = strip(chatDraft)
   chatDraft.setLen(0)
   if text.len == 0 or run == nil:
+    return
+  if matchNetwork != nil:
+    if not matchNetwork.queueChat(text):
+      setHumanError("CHAT COULD NOT BE SENT")
     return
   let slot =
     if humanControlActive() and heroIndex() >= 0: int32(heroIndex())
@@ -2539,7 +2207,7 @@ proc handleChatInput(
     sk: Silky, window: Window, panel: GameUiPanel
 ) =
   ## Enter opens or sends; Escape cancels; runes type into the draft.
-  if menuOpen or controlsOpen or not chatInputEnabled:
+  if menuOpen:
     cancelChatTyping()
     return
   let
@@ -2548,9 +2216,8 @@ proc handleChatInput(
   if window.buttonPressed[MouseLeft]:
     if chatVisible and onChat and input.contains(sk.mousePos):
       chatComposing = true
-      chatVisible = false
-    elif chatComposing and (not chatVisible or not panel.contains(sk.mousePos)):
-      chatComposing = false
+    elif chatComposing and not panel.contains(sk.mousePos):
+      cancelChatTyping()
   if window.buttonPressed[KeyEscape] and chatComposing:
     cancelChatTyping()
     return
@@ -2558,8 +2225,9 @@ proc handleChatInput(
     if chatComposing:
       sendChatDraft()
       chatComposing = false
+      chatVisible = true
     else:
-      chatVisible = false
+      chatVisible = true
       chatTab = ChatTabChat
       chatComposing = true
     return
@@ -2569,11 +2237,11 @@ proc handleChatInput(
     let runes = chatDraft.toRunes
     if runes.len > 0:
       chatDraft = $runes[0 ..< runes.high]
-  for rune in sk.inputRunes:
-    if int(rune) < 32:
-      continue
-    if chatDraft.toRunes.len >= MaxChatDraft:
-      break
+
+proc addChatRune*(rune: unicode.Rune) =
+  ## Adds one printable character to the match chat draft.
+  if chatComposing and int(rune) >= 32 and
+      chatDraft.runeLen < MaxChatDraft:
     chatDraft.add $rune
 
 proc drawLogTabs(sk: Silky, panel: GameUiPanel) =
@@ -2671,7 +2339,7 @@ proc drawChatPanel(sk: Silky, window: Window, layout: GameUiLayout) =
   let panel = chatPanelOf(layout)
   handleLogTabs(sk, window, panel)
   handleChatInput(sk, window, panel)
-  if not chatVisible:
+  if not chatVisible and not chatComposing:
     return
   sk.drawPanel(panel)
   sk.drawFrame(panel.inset(2))
@@ -2699,31 +2367,17 @@ proc drawChatPanel(sk: Silky, window: Window, layout: GameUiLayout) =
     "Small"
   )
 
-proc applyChipClick(id: int, transport: var Player) =
-  ## Toggles the overlay that matches one minimap chip.
+proc applyChipClick(id: int) =
+  ## Toggles the match overlay selected from the compass plate.
   case id
   of ChipMenu:
-    menuOpen = not menuOpen
-    if menuOpen:
-      menuCursor = 0
-      controlsOpen = false
-      cancelChatTyping()
-    else:
-      controlsOpen = false
-    transport.playing = not menuOpen
+    toggleMatchMenu()
   of ChipTeam:
     alliesOpen = not alliesOpen
   of ChipLog:
     chatVisible = not chatVisible
     if not chatVisible:
       cancelChatTyping()
-    if menuOpen:
-      menuOpen = false
-      transport.playing = true
-  of ChipReplay:
-    toggleTransportBar()
-  of ChipDebug:
-    toggleDebugMenu()
   else:
     discard
 
@@ -2738,7 +2392,7 @@ proc drawDebugLegendSwatch(
 proc drawDebugOverlaysHud(sk: Silky, layout: GameUiLayout) =
   ## Layer color key plus the play-viewport outline.
   if showCamera:
-    let play = layout.worldPanel
+    let play = GameUiPanel(size: layout.size)
     let rim = rgbx(240, 218, 128, 220)
     sk.drawRect(play.origin, vec2(play.size.x, 2), rim)
     sk.drawRect(
@@ -2771,90 +2425,6 @@ proc drawDebugOverlaysHud(sk: Silky, layout: GameUiLayout) =
   y += 14
   sk.drawDebugLegendSwatch(vec2(x, y), DebugBlocked, "Blocked land")
 
-proc debugPingLine(): string =
-  ## Client→host WebSocket RTT, or 0 on the host/local machine.
-  if netRole != NetClient:
-    return "Ping: 0 ms  (local)"
-  if not netPingKnown():
-    return "Ping: ..."
-  let jitter = netPingJitterMs()
-  if jitter > 0:
-    return &"Ping: {netPingMs()} ms  jitter {jitter} ms"
-  &"Ping: {netPingMs()} ms"
-
-proc applyNetSimEdits(cfg: var NetSimConfig) =
-  cfg.enabled = true
-  netSimConfigure(cfg)
-  netSimSetLogging(true)
-
-proc drawNetSimDebugControls(sk: Silky, window: Window) =
-  ## F3 sliders for the client-side latency simulator. Host/local play
-  ## has no follower packets, so the controls stay hidden there.
-  if netRole != NetClient:
-    return
-  var cfg = netSimConfig()
-  text "Network sim  F6 overlay  F7 cycle preset"
-  var enabled = cfg.enabled
-  checkBox "Simulate latency / jitter / loss", enabled
-  if enabled != cfg.enabled:
-    netSimEnable(enabled)
-  text &"preset {netSimLabel()}   one-way {cfg.latencyMs}±{cfg.jitterMs} ms" &
-    &"   loss {cfg.packetLossPercent:.1f}%"
-  text &"expected RTT ≈ {cfg.latencyMs * 2} ms   sim {TickRate} Hz (fixed)"
-  button "Next preset (local/good/poor/extreme/off)":
-    netSimAdvanceCycle()
-  var lat = cfg.latencyMs
-  text "Latency ms (0 / 100 / 250 / 500)"
-  scrubber "netLat", lat, 0, 500, ""
-  if lat != cfg.latencyMs:
-    cfg.latencyMs = lat
-    applyNetSimEdits(cfg)
-    cfg = netSimConfig()
-  var jit = cfg.jitterMs
-  text "Jitter ± ms"
-  scrubber "netJit", jit, 0, 200, ""
-  if jit != cfg.jitterMs:
-    cfg.jitterMs = jit
-    applyNetSimEdits(cfg)
-    cfg = netSimConfig()
-  var loss = cfg.packetLossPercent
-  text "Outbound packet loss %"
-  scrubber "netLoss", loss, 0.0, 20.0, ""
-  if abs(loss - cfg.packetLossPercent) > 0.05:
-    cfg.packetLossPercent = loss
-    applyNetSimEdits(cfg)
-    cfg = netSimConfig()
-  var delayOut = cfg.delayOutbound
-  var delayIn = cfg.delayInbound
-  checkBox "Delay outbound (intents / pings)", delayOut
-  checkBox "Delay inbound (host tape)", delayIn
-  if delayOut != cfg.delayOutbound or delayIn != cfg.delayInbound:
-    cfg.delayOutbound = delayOut
-    cfg.delayInbound = delayIn
-    applyNetSimEdits(cfg)
-    cfg = netSimConfig()
-  var dropIn = cfg.dropInbound
-  checkBox "Drop inbound (desyncs the tape — debug only)", dropIn
-  if dropIn != cfg.dropInbound:
-    cfg.dropInbound = dropIn
-    applyNetSimEdits(cfg)
-    cfg = netSimConfig()
-  let so = netSimStats(DirOutbound)
-  let si = netSimStats(DirInbound)
-  text &"out sent {so.offered}  delayed {so.delayed}  dropped {so.dropped}" &
-    &"  q {so.queueDepth}/{so.queueMax}"
-  text &"in  recv {si.offered}  delayed {si.delayed}  dropped {si.dropped}" &
-    &"  q {si.queueDepth}/{si.queueMax}"
-  when defined(emscripten):
-    if predictor.enabled:
-      text &"predict lead {predictor.lead}/{MaxLead} ticks  pending " &
-        $predictor.pending.len & "  snaps " & $predictor.snapCount &
-        (if predictor.snapped: "  SNAP" else: "")
-    else:
-      text "predict idle (no seat yet)"
-  else:
-    text "predict off — native join is lockstep; browser client has prediction"
-
 proc drawDebugMenu(
     sk: Silky,
     window: Window,
@@ -2875,9 +2445,6 @@ proc drawDebugMenu(
       DebugWindowOrigin,
       DebugWindowSize
     ):
-      text debugPingLine()
-      text "F2 frame rate / Fluffy trace"
-      drawNetSimDebugControls(sk, window)
       checkBox "Fog of war", fogOfWar
       checkBox "Record bug tape", recordOn
       if recordOn != bugTapeArmed:
@@ -2938,45 +2505,6 @@ proc drawDebugMenu(
   finally:
     sk.endDsl()
   cameraDistance = clampCameraDistance(cameraDistance)
-
-proc drawFpsDebugger(sk: Silky, window: Window) =
-  ## F2 frame-rate window: live fps, optional cap, interpolation, Fluffy.
-  noteFps()
-  if not fpsDebuggerOpen:
-    return
-  sk.beginDsl()
-  try:
-    subWindow(
-      FpsWindowTitle,
-      fpsDebuggerOpen,
-      FpsWindowOrigin,
-      FpsWindowSize
-    ):
-      text "FPS"
-      text "fpsNow":
-        font "Mono"
-        characters fpsNowText
-      text "fpsAvg":
-        font "Mono"
-        characters fpsAvgText
-      text "fpsStd":
-        font "Mono"
-        characters fpsStdText
-      text "FPS limit (0 = vsync)"
-      scrubber(
-        "fpsLimit",
-        framePaceHz,
-        0,
-        FpsLimitMax,
-        $framePaceHz
-      )
-      checkBox "Interpolation", interpolateVisuals
-      if runtimeTraceActive():
-        text "Fluffy recording… F2 writes tmp/fluffy.json"
-      else:
-        text "F2 starts a Fluffy frame trace"
-  finally:
-    sk.endDsl()
 
 proc centerCameraOnInspect(
     window: Window,
@@ -3181,7 +2709,7 @@ proc drawUi*(
     actionCam: var ActionCam,
     followSelection: var bool,
     cameraEye = vec3(0)
-) =
+): MatchMenuAction =
   var
     layout = currentLayout(window)
     chrome = placeChrome(layout)
@@ -3208,13 +2736,11 @@ proc drawUi*(
   sk.drawBottomChrome(chrome.bottom, clusterVisible)
   sk.drawMinimap(window, chrome.bottom, cameraTarget, cameraDistance)
   # Menu, auto-lock, and director on the compass nameplate.
-  # Allies, Chat, Replay, and Debug stay on the pause menu; F10 / F11
-  # still toggle Allies / the chat-and-events plate.
   let clicked = sk.drawChipRow(
     window,
     chrome.bottom.buttons,
     [
-      HudChip(id: ChipMenu, label: "MENU", key: KeyF9, active: menuOpen),
+      HudChip(id: ChipMenu, label: "MENU", active: menuOpen),
       HudChip(
         id: ChipFollow, label: "AUTO", key: bindKey(BindFollow),
         active: followSelection
@@ -3236,14 +2762,14 @@ proc drawUi*(
   elif clicked == ChipDirector:
     actionCam.toggle(followSelection)
   elif clicked >= 0:
-    applyChipClick(clicked, transport)
-  if window.buttonPressed[KeyF10]:
-    applyChipClick(ChipTeam, transport)
-  if window.buttonPressed[KeyF11]:
-    applyChipClick(ChipLog, transport)
+    applyChipClick(clicked)
+  if window.buttonPressed[KeyF10] and not chatTyping():
+    applyChipClick(ChipTeam)
+  if window.buttonPressed[KeyF11] and not chatTyping():
+    applyChipClick(ChipLog)
   if clusterVisible:
     sk.drawBottomUnit(
-      window, chrome.bottom, transport.inHistory and netRole != NetClient
+      window, chrome.bottom, transport.inHistory
     )
   sk.drawShopPanel(window, layout)
   centerCameraOnInspect(
@@ -3310,8 +2836,8 @@ proc drawUi*(
         CenterAlign
       )
     let seatHint =
-      if netRole == NetClient:
-        "SPECTATING - PICK A SEAT FROM THE HOST'S LOBBY PAGE"
+      if matchNetwork != nil:
+        "SPECTATING"
       else:
         "TAKE A SEAT: PRESS 1-0, OR T OVER A BUTCHER"
     # Shadow pass keeps the hint readable over the fire pit.
@@ -3333,16 +2859,13 @@ proc drawUi*(
     )
   sk.drawDebugOverlaysHud(layout)
   sk.drawDebugMenu(window, cameraTarget, cameraDistance, cameraEye)
-  sk.drawFpsDebugger(window)
+  sk.drawDebugMenu(window,
+    network = if matchConnection == nil: nil else: matchConnection.stats)
+  sk.drawConnectionNotice(layout)
   # Modals last so they cover chrome, kill-feed toasts, and world labels.
   if alliesOpen:
     sk.drawRoster(window, chrome.west, WestTeam, "West bank", followSelection)
     sk.drawRoster(window, chrome.east, EastTeam, "East bank", followSelection)
-  if menuOpen:
-    if controlsOpen:
-      sk.drawControlsOverlay(window, layout, transport)
-    else:
-      sk.drawMenuOverlay(window, layout, transport)
   if run.replayMode:
     if run.hashCheck.error.len > 0:
       sk.drawError(
@@ -3352,7 +2875,7 @@ proc drawUi*(
         run.hashCheck.error
       )
   publishMatchState()
-  if run.world.gameOver:
-    sk.drawEndScreen(window, layout)
+  if matchResultsVisible() and not menuOpen:
+    result = sk.drawEndScreen(layout)
   else:
     recapPublished = false

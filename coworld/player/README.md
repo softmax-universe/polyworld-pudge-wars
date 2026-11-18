@@ -1,6 +1,6 @@
 # Aaron's Base-derived rusher
 
-For Metta RL, PufferLib, and Metta post-training against the hosted simulation,
+For Metta RL, PufferLib, and Metta post-training against the local simulation,
 see [the training bridge](../TRAINING.md).
 
 `base.py` implements the improved native Base strategy over the released
@@ -16,7 +16,7 @@ the home bank. See the
 [simulation study](../../games/pudge-wars/experiments/2026-09-10-hp1200-blink.md).
 Crossing requires `game_version >= 35`; older hosts retain their Blink behavior.
 
-Current 3v3 champion: **`pudge-wars-rusher:v14`**, policy-version ID
+3v3 champion at the time of this release: **`pudge-wars-rusher:v14`**, policy-version ID
 `41212e9a-6383-40f8-b44e-f4ceb64ef9c9`, membership
 `lpm_a897a072-a07b-4aef-90fe-ef6e256640b5`.
 Coworld: `cow_d1aad864-85bf-4028-b9c9-34d4e1a0c044`, platform-hosted Docker players.
@@ -70,58 +70,16 @@ confirmed inventory item before making a placement trip. The live
 host treats `halt` as exclusive, discarding other actions in the same reply;
 rescue holds instead use a walk target at the current position.
 
-## Play alongside this policy locally
+## Local verification
 
-From the repository root:
-
-```sh
-uv run scripts/play_policy.py
-```
-
-Or double-click [play_policy.command](../../scripts/play_policy.command).
-The launcher builds matching native host/client binaries and opens your seat:
-**P1 is Aaron, P2–P3 are Base v13, and P4–P6 are Base v10**. It runs the Python
-policy directly on this machine; Docker and Coworld credits are not needed.
-Both healing and fishing spacing are enabled for your teammates. Nameplates
-identify each seat. These matches use the current local game rules, which
-now match hosted Coworld 0.3.17 except for later uncommitted edits.
-
-Move with WASD or right-click; press Q then click to hook, E to grapple,
-F to blink, R to toggle Rot, X to stop, G to ping, and 1–4 to upgrade.
-F1 centers your hero. Add `--quickcast` to throw on Q press at the cursor,
-`--opponent combined` to face v13, or `--name NAME` to change your name.
-Close the window or press Ctrl-C to stop; rerun the command for a new match.
-Completed matches save a replay and logs under `duels/local-policy/match-*`.
-An interrupted match keeps its logs but does not produce a complete replay.
-
-`./pw --human` uses native BASIC bots; use the launcher above for the Python
-policy's healing and spacing improvements.
-
-## Build and validate
-
-Run from the repository root:
+The retained Python policy can be used with local JSON observations and the
+[symbolic evaluation harness](../../coaching/symbolic/README.md). Use Single
+Player or Multiplayer in the game to play with native BASIC policies.
 
 ```sh
 python3 -m unittest discover -s tests -p test_pw_coworld_policy.py
 python3 -m unittest discover -s tests -p test_pw_support_analysis.py
-docker build --platform linux/amd64 -f coworld/player/Dockerfile \
-  -t pudge-support:combined-20260910 coworld
 ```
-
-Use a current Coworld CLI to download the canonical package and run a complete
-episode with one explicit image per seat. The installed June CLI rejects the
-live manifest's `tags`; the tested Docker CLI is pinned to the public mirror at
-`4c26e519040ffe7182104f3417035020acea607b`:
-
-```sh
-uvx --from 'coworld[auth] @ git+https://github.com/softmax-universe/coworld.git@4c26e519040ffe7182104f3417035020acea607b' \
-  coworld download cow_548c1ac0-e9af-483e-bc7c-7048991ad267
-```
-
-The image command is `python -m coworld.examples.pudgewars.player.player`.
-For mixed-image matches, pass that explicit `--run` argv so older bundled game
-images start their policy role. This standalone Dockerfile only builds the
-policy; no game rebuild is required.
 
 Study artifacts are under `duels/coworld-base-l4r3452l/`: the downloaded live
 manifest, old player source, local smoke/full episode logs and replays, unit
@@ -200,7 +158,7 @@ The driver chooses them through `PUDGE_POLICY_ARM`:
 | `spacing` | Stable fishing lanes survive teammate deaths; one player collects an announced rune while the others keep separated lanes |
 | `combined` (default) | Both changes; the validated v13 3v3 configuration |
 
-For Docker, use `--build-arg POLICY_ARM=healing`, `spacing`, or `combined`.
+The original Docker build selected the policy arm with `POLICY_ARM`.
 The frozen policy versions are v11 (healing), v12 (spacing), and v13
 (combined). Their IDs and
 validation status live in the [version log](../../games/pudge-wars/players/pudge-wars-rusher/VERSION_LOG.md),

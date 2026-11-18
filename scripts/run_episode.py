@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run local BASIC episodes through the league host, without Docker."""
+"""Run local BASIC episodes and save their artifacts."""
 from __future__ import annotations
 
 import argparse
@@ -11,7 +11,6 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
-import time
 
 ROOT = Path(__file__).resolve().parents[1]
 POLICY_DIR = ROOT / "examples/pudge_wars/players"
@@ -45,16 +44,16 @@ def expand_policies(specifications: list[str]) -> list[Path]:
     return policies
 
 
-def build_host(output: Path, nim: str) -> Path:
+def build_runner(output: Path, nim: str) -> Path:
     binary = output / "pwleague"
     with tempfile.TemporaryDirectory(prefix="pudge-build-") as cache:
         command = [nim, "c", "--hints:off", "--threads:on", "-d:ssl", "-d:release",
-                   "-d:basicLeague", f"--nimcache:{cache}", f"-o:{binary}",
-                   "examples/pudge_wars/coworld_host.nim"]
+                   f"--nimcache:{cache}", f"-o:{binary}",
+                   "examples/pudge_wars/episodes.nim"]
         with (output / "build.log").open("w") as log:
             result = subprocess.run(command, cwd=ROOT, stdout=log, stderr=log)
         if result.returncode:
-            raise RuntimeError(f"Host build failed; see {output / 'build.log'}")
+            raise RuntimeError(f"Episode runner build failed; see {output / 'build.log'}")
     return binary
 
 
@@ -79,15 +78,14 @@ def run_episode(policies: list[Path], output: Path, binary: Path,
                       "annotations_uri": (directory / "annotations.jsonl").as_uri()})
         provenance.append({"slot": slot, "team": "west" if slot < len(policies) // 2 else "east",
                            "source": str(path), "content_hash": digest})
-    config = {"tokens": [f"local-{slot}" for slot in range(len(policies))],
-              "players": [{"name": path.stem} for path in policies],
+    config = {"players": [{"name": path.stem} for path in policies],
               "seed": seed, "max_ticks": ticks, "kill_goal": kill_goal, "fog": True, "wait_for_llm": llm_mode == "barrier"}
     write_json(output / "config.json", config)
     write_json(output / "player_seats.json", {"schema": "coworld-player-seats/2",
                "seats": seats, "player_status_uri": (output / "player_status.json").as_uri()})
     write_json(output / "episode.json", {"config": config, "policies": provenance,
                "binary": str(binary), "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest()})
-    # Clear inherited runner settings so, for example, replay mode cannot leak in.
+    # Inherit inference settings only when explicitly enabled for this episode.
     env = {key: value for key, value in os.environ.items() if not key.startswith("COGAME_")}
     if llm:
         for key, value in os.environ.items():
@@ -99,36 +97,25 @@ def run_episode(policies: list[Path], output: Path, binary: Path,
                 "COGAME_PLAYER_SEATS_URI": (output / "player_seats.json").as_uri(),
                 "COGAME_RESULTS_URI": (output / "results.json").as_uri(),
                 "COGAME_SAVE_REPLAY_URI": (output / "replay.pwr").as_uri(),
-                "COGAME_PLAYER_FAILURE_URI": (output / "player_failure.json").as_uri(),
-                "COGAME_HOST": "127.0.0.1", "COGAME_PORT": "0"})
+                "COGAME_PLAYER_FAILURE_URI": (output / "player_failure.json").as_uri()})
     with (output / "game.log").open("w") as log:
-        process = subprocess.Popen([str(binary)], cwd=ROOT, env=env, stdout=log, stderr=log)
         try:
-            deadline = time.monotonic() + timeout
-            while not (output / "results.json").exists() and not (output / "player_failure.json").exists():
-                if process.poll() is not None:
-                    raise RuntimeError(f"Host exited with code {process.returncode}; see {output / 'game.log'}")
-                if time.monotonic() >= deadline:
-                    raise RuntimeError(f"Episode exceeded {timeout:g} seconds; see {output / 'game.log'}")
-                time.sleep(0.02)
-        finally:
-            if process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait()
+            process = subprocess.run([str(binary)], cwd=ROOT, env=env,
+                                     stdout=log, stderr=log, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"Episode exceeded {timeout:g} seconds; see {output / 'game.log'}") from None
     if (output / "player_failure.json").exists():
         failure = json.loads((output / "player_failure.json").read_text())
         slot = failure["failed_policy_index"]
         print(f"Policy in slot {slot} failed to load; see {output / 'players' / str(slot) / 'log.txt'}",
               file=sys.stderr)
         return 2
+    if process.returncode:
+        raise RuntimeError(f"Episode runner exited with code {process.returncode}; see {output / 'game.log'}")
     status = json.loads((output / "player_status.json").read_text())
     results = json.loads((output / "results.json").read_text())
     if len(results["scores"]) != len(policies) or not (output / "replay.pwr").stat().st_size:
-        raise RuntimeError("Host produced incomplete episode artifacts")
+        raise RuntimeError("Episode runner produced incomplete artifacts")
     print(f"{results['winner_team']}: {results['west_kills']}-{results['east_kills']} "
           f"at tick {results['end_tick']} ({results['end_reason']})")
     failed = [seat["slot"] for seat in status["players"] if seat["exit_code"] != 0]
@@ -152,9 +139,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--binary", type=Path, help="Use an existing pwleague binary instead of compiling")
     parser.add_argument("--nim", default=os.environ.get("NIM", "nim"), help="Nim compiler (default: NIM or nim on PATH)")
     parser.add_argument("--timeout", type=float, default=120, help="Episode wall-clock timeout in seconds")
-    parser.add_argument("--llm", action="store_true", help="Enable host-configured LLM/Jev inference")
+    parser.add_argument("--llm", action="store_true", help="Enable LLM/Jev inference from the local environment")
     parser.add_argument("--llm-mode", choices=("async", "barrier"), default="barrier",
-                        help="Wait for concurrent inference requests between ticks (default: barrier)")
+                        help="Wait for all inference requests between ticks (default: barrier)")
     args = parser.parse_args(argv)
     if args.list_policies:
         print("\n".join(POLICIES))
@@ -181,7 +168,7 @@ def main(argv: list[str] | None = None) -> int:
             output = Path(tempfile.mkdtemp(prefix="episode-", dir=parent))
         print(f"Artifacts: {output}", flush=True)
         nim = str(Path(args.nim).expanduser().resolve()) if "/" in args.nim else args.nim
-        binary = binary or build_host(output, nim)
+        binary = binary or build_runner(output, nim)
         return run_episode(policies, output, binary, args.seed, ticks, goal, args.timeout, args.llm, args.llm_mode)
     except (OSError, ValueError, RuntimeError) as error:
         print(f"error: {error}", file=sys.stderr)

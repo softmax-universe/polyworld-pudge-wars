@@ -1,6 +1,6 @@
 ## Real simulator checks for asynchronous tactical control over BASIC.
 import std/[json, os]
-import polyworld/cli
+import pudgewars/cli
 import ../examples/pudge_wars/[bots, hybrid, maps, replays, sim, tactics]
 
 let policy = currentSourcePath().parentDir.parentDir /

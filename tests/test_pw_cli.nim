@@ -1,6 +1,6 @@
 ## Shared CLI flags used by the graphical client.
 
-import polyworld/cli
+import pudgewars/cli
 
 proc parseCommon(arguments: seq[string]): GameOptions =
   ## Parses only shared flags, the same way the game loop would.

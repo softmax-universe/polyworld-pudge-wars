@@ -1,9 +1,8 @@
 # PolyWorld design
 
-This is the engine design document. For clone, toolchain, and Hook Royale
-development instructions, see the root [readme.md](../readme.md). This
-snapshot ships art in `./polyworld_data`; a sibling `../polyworld_data`
-checkout still works.
+This draft describes the historical Polyworld snapshot. Its example commands
+refer to that snapshot's source and assets. For this Pudge Wars checkout, see
+[Build and run Pudge Wars](building.md).
 
 Status: Draft
 

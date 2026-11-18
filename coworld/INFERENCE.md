@@ -1,7 +1,7 @@
 # Neural policies and Jev
 
-Pudge Wars uses GotA's Bassy tensor API and per-seat inference client, ported
-from Polyworld `743f108091ca20b78f7e3fdc1a42f59ddb4ac795`.
+Pudge Wars uses Polyworld’s shared Bassy tensor API and per-seat inference
+client.
 Python and native executables are not player artifacts. A neural policy is a
 BASIC program plus weights; BASIC builds observations and issues game actions.
 
@@ -74,9 +74,10 @@ chat model. `COGAME_LLM_TIMEOUT_MS` defaults to 30,000 and is bounded at 120,000
 `COGAME_LLM_INTERVAL` spaces requests by simulation ticks; it does not replace
 the hosted wall-clock rate limit. `COGAME_ORACLE=off` disables Jev helpers.
 
-The default `wait_for_llm: true` runs all due decisions first, then waits for
-their concurrent requests to settle before advancing the simulation. A reply
-is consumed on the next decision. One pending request is allowed per seat.
+The default `wait_for_llm: true` runs all due decisions first and waits for
+each request to settle before advancing the simulation. The shared HTTP
+transport can serialize HTTP/1.1 requests to the same origin. Each seat can
+submit one pending request and consumes the reply on its next decision.
 Local `--llm-mode async` sets `wait_for_llm: false`, allowing simulation to
 continue while requests run. The simulation still uses 32 Hz game time.
 Headless episodes can finish before a response arrives in async mode.
@@ -86,7 +87,7 @@ bitwise agreement across hardware. Recorded actions still replay without
 calling a model, and every simulation tick can be verified. Model inputs,
 Jev replies, PRINT output, and annotations stay out of public action replays.
 
-The integration tests use a local SystemOne mock: simultaneous requests from
-two seats, correct slot headers and model, private answers, invalid responses,
-timeouts, and disabled-by-default local networking. No paid provider is needed
+The integration tests use a local SystemOne mock to check slots and model
+selection for two seats, private answers, invalid responses, timeouts and
+explicit opt-in for inference. No paid provider is needed
 for `scripts/test_league.sh`.

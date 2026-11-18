@@ -14,14 +14,18 @@ if [[ ! -d "${polyworld_root}/examples/pudge_wars" ]]; then
   echo "polyworld root not found at ${polyworld_root}; set POLYWORLD_ROOT" >&2
   exit 1
 fi
-if [[ -d "${polyworld_root}/polyworld_data" ]]; then
-  data_dir="${polyworld_root}/polyworld_data"
-elif [[ -d "${polyworld_root}/../polyworld_data" ]]; then
-  data_dir="${polyworld_root}/../polyworld_data"
+if [[ -n "${POLYWORLD_ART:-}" ]]; then
+  data_dir="${POLYWORLD_ART}"
+elif [[ -d "${polyworld_root}/build/polyworld_art" ]]; then
+  data_dir="${polyworld_root}/build/polyworld_art"
 else
-  echo "polyworld_data not found next to ${polyworld_root}; clone softmax-universe/polyworld-data" >&2
+  data_dir="${polyworld_root}/../polyworld_art"
+fi
+if [[ ! -d "${data_dir}" ]]; then
+  echo "art directory not found at ${data_dir}; set POLYWORLD_ART or run scripts/recover_art.py" >&2
   exit 1
 fi
+export POLYWORLD_ART="$(cd "${data_dir}" && pwd)"
 webdata="${polyworld_root}/examples/pudge_wars/webdata.txt"
 if [[ -f "${webdata}" ]]; then
   missing=0
@@ -35,7 +39,7 @@ if [[ -f "${webdata}" ]]; then
     fi
   done < "${webdata}"
   if [[ "${missing}" -ne 0 ]]; then
-    echo "commit the missing files to softmax-universe/polyworld-data (atlas pngs need a gitignore exception)" >&2
+    echo "set POLYWORLD_ART to a complete asset directory or run scripts/recover_art.py" >&2
     exit 1
   fi
 fi
@@ -72,6 +76,11 @@ done
 if [[ -f "${src}/pw.data" ]]; then
   cp "${src}/pw.data" "${output_dir}/pw.data"
 fi
+for notice in ASSET-LICENSES.txt LICENSE; do
+  if [[ -f "${POLYWORLD_ART}/${notice}" ]]; then
+    cp "${POLYWORLD_ART}/${notice}" "${output_dir}/${notice}"
+  fi
+done
 sim_version="$(
   sed -n 's/^  ReplayGameVersion\* = \([0-9][0-9]*\).*/\1/p' \
     "${polyworld_root}/examples/pudge_wars/replays.nim" | head -1

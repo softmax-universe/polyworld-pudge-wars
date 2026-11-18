@@ -2,7 +2,7 @@
 
 import
   std/strutils,
-  polyworld/[cli, fixed, pathing, tapes],
+  polyworld/[pathing, tapes], pudgewars/[cli], fixxy,
   ../examples/pudge_wars/bots,
   ../examples/pudge_wars/content,
   ../examples/pudge_wars/maps,

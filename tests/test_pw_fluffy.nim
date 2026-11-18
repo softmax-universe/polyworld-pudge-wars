@@ -11,7 +11,7 @@ profileBlock "frame":
     discard
   profileBlock "draw":
     discard
-  profilePush("worldDraw")
-  profilePop()
+  profileBlock "worldDraw":
+    discard
 
 echo "test_pw_fluffy: all checks passed"

@@ -1,7 +1,7 @@
 ## Local native BASIC evaluation with complete action replay and diagnostic events.
 ## policy opponent teamSize seed ticks outputDir [fixture.json] [botEvery] [aimNoise]
 import std/[json, os, strutils]
-import polyworld/cli
+import pudgewars/cli
 import ../../../examples/pudge_wars/[bots, content, maps, replays, sim, duellog]
 
 let candidate = paramStr(1)

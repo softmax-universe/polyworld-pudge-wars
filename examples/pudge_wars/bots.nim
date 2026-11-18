@@ -12,7 +12,7 @@
 import
   bassy,
   std/[os, sha1, strutils],
-  polyworld/[annotations, cli, llms, policies, tensors, timings, pathing, profiles, rngs, tapes],
+  polyworld/[annotations, llms, policies, tensors, timings, pathing, profiles, rngs, tapes], pudgewars/[cli],
   content,
   maps,
   sim,
@@ -645,7 +645,9 @@ proc loadBots*(game: Game, groups: openArray[BotGroup], hybridSlots: seq[int] = 
   ## seats get a VM too, so releasing control falls back to script
   ## autopilot. With one program per non-human seat, human seats stay
   ## VM-free and cost nothing.
+  let previous = activeGame
   activeGame = game
+  defer: activeGame = previous
   let limits = pudgeVmLimits()
   var schema = initPudgeHost(0)
   var
@@ -698,7 +700,9 @@ proc loadBots*(game: Game, groups: openArray[BotGroup], hybridSlots: seq[int] = 
 proc loadBotSource*(game: Game, slot: int, source: string,
                     output: PrintProc, annotations: AnnotationSink) =
   ## Each staged source compiles and executes in its own bounded VM.
+  let previous = activeGame
   activeGame = game
+  defer: activeGame = previous
   let limits = pudgeVmLimits()
   let policy = loadPolicy(source)
   let llm = newLlmClient(slot)
@@ -836,17 +840,20 @@ proc isHumanSlot*(game: Game, index: int): bool =
   ## Returns whether a human currently drives this roster slot.
   index in game.humanSlots
 
-proc runBotDecisions*(game: Game) {.measure.} =
+proc runBotDecisions*(game: Game, includeHumans = true) {.measure.} =
   ## Runs every seat's decision source in rotation order: human seats
   ## drain their intent queue, bot seats run their script on the
   ## configured cadence (staggered by slot so bots do not act in bursts).
+  let previous = activeGame
   activeGame = game
+  defer: activeGame = previous
   if game.world.pudges.len == 0:
     return
   for offset in 0 ..< game.world.pudges.len:
     let index = (game.world.heroTurnStart + offset) mod game.world.pudges.len
     if game.isHumanSlot(index):
-      runHumanIntents(game, index)
+      if includeHumans:
+        runHumanIntents(game, index)
     elif game.botEvery <= 1 or
         (int(game.world.tick) + index) mod int(game.botEvery) == 0:
       runPudgeScript(game, index)
@@ -862,6 +869,10 @@ proc waitForBotRequests*(game: Game) =
   waitForRequests(pollers)
 
 proc closeBotServices*(game: Game) =
+  ## Releases services once when a prepared or played game is discarded.
   for vm in game.heroVms:
     if vm != nil and vm.closeServices != nil:
       vm.closeServices()
+      vm.closeServices = nil
+      vm.prepareDecision = nil
+      vm.pollRequests = nil

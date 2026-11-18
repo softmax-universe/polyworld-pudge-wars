@@ -1,7 +1,7 @@
 ## Follow-up timing drill: finisher observes the full cast but its hook stays
 ## on cooldown until the allied catch. Normal movement remains enabled.
 ## This isolates measured-speed follow-up aiming, not natural hook readiness.
-import std/[os, json], polyworld/cli,
+import std/[os, json], pudgewars/cli,
   ../../../examples/pudge_wars/[bots, content, maps, replays, sim]
 if paramCount() != 1:
   quit "Usage: double_hook_followup_scenarios path/to/policy.bas", 1

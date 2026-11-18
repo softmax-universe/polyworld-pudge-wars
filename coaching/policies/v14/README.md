@@ -1,12 +1,8 @@
 # v14 league practice and coaching
 
-Run a standard three-versus-three game:
-
-```sh
-cd /Users/aaln/experiments/softmax/polyworld-pudge-wars
-open -a "Co-play Notes"
-uv run scripts/play_policy.py --name Aaron --opponent combined
-```
+This record describes the original 3v3 mirror-practice launcher and the
+Co-play Notes sessions that used it. The [migration guide](../../../coworld/GAME_HOSTED_MIGRATION.md)
+describes the current local evaluation workflow.
 
 P1 is Aaron; P2–P3 are allied Base v14 bots; P4–P6 are enemy Base v14 bots.
 This is **mirror practice**, not a local copy of Richard's hosted policy.

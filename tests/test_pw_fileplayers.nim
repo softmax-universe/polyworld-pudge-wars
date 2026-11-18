@@ -1,5 +1,5 @@
 import std/[json, os, strutils, tempfiles, unittest], bassy,
-  polyworld/[cli, tapes],
+  polyworld/[tapes], pudgewars/[cli],
   ../examples/pudge_wars/[bots, content, fileplayers, maps, replays, sim]
 
 let root = createTempDir("pudge-fileplayers-", "")
@@ -24,7 +24,7 @@ proc fixture(sources: openArray[string], name: string): tuple[
   result.game = newGame(generateMap(7, if sources.len == 2: TeamSize else: sources.len div 2),
     128, false, ReplayData(), duel = sources.len == 2)
 
-suite "game-hosted BASIC seats":
+suite "staged BASIC seats":
   test "local paths preserve literal plus and reject remote URIs":
     check localPath("file:///tmp/a+b%20c") == "/tmp/a+b c"
     for path in ["https://example.com/file", "file://host/tmp/file", "relative",
@@ -38,28 +38,11 @@ suite "game-hosted BASIC seats":
       expect FilePlayerError:
         discard openFilePlayers(document, 2, "file://" & root & "/failure")
 
-  test "a play-seats roster seats people only when humans are allowed":
-    let dir = root / "mixed"
-    createDir(dir / "1")
-    writeFile(dir / "1/file", "counter = 1\n")
+  test "legacy live rosters are rejected before opening outputs":
     let document = %*{"schema": "coworld-play-seats/1", "seats": [
-      {"slot": 0, "kind": "human"},
-      {"slot": 1, "kind": "policy", "file_uri": "file://" & dir & "/1/file",
-       "size_bytes": 12, "log_uri": "file://" & dir & "/1/log"}],
-      "player_status_uri": "file://" & dir & "/status"}
+      {"slot": 0, "kind": "human"}, {"slot": 1, "kind": "human"}]}
     expect FilePlayerError:
-      discard openFilePlayers(document, 2, "file://" & dir & "/failure")
-    let players = openFilePlayers(document, 2, "file://" & dir & "/failure",
-      allowHumans = true)
-    check players.humanSlots == @[0]
-    # A human seat stages nothing: only the policy seat opens a log.
-    check fileExists(dir / "1/log") and not fileExists(dir / "0/log")
-    players.close()
-    expect FilePlayerError:
-      discard openFilePlayers(%*{"schema": "coworld-play-seats/1", "seats": [
-        {"slot": 0, "kind": "spectator"}, {"slot": 1, "kind": "human"}],
-        "player_status_uri": "file://" & dir & "/status"}, 2,
-        "file://" & dir & "/failure", allowHumans = true)
+      discard openFilePlayers(document, 2, "file://" & root & "/failure")
 
   test "extensionless files keep variables, strings, prints and annotations private":
     let f = fixture([

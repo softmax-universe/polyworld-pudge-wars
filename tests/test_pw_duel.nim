@@ -3,7 +3,7 @@
 
 import
   std/[json, os, strutils, tempfiles],
-  polyworld/[cli, tapes],
+  polyworld/[tapes], pudgewars/[cli],
   ../examples/pudge_wars/[bots, content, duellog, maps, replays, sim]
 
 let

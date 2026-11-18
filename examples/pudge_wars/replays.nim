@@ -17,12 +17,14 @@ when defined(posix):
 
 const
   ReplayGame* = "pudge_wars"
+  LegacyReplayFileVersion = 1'u16
+  ReplayFileFixedBytes = 6
   ReplayFormatVersionV4* = 4'u16
     ## Format before seat labels: Setup ended at `pudges`.
-  ReplayFormatVersion* = 5'u16
-    ## v5: Setup.seatLabels — policy / lobby names for Observatory WASM
-    ##     nameplates. Physics are unchanged; game version stayed 37.
-    ##     Load still accepts v4 tapes (empty labels → P1..Pn).
+  ReplayFormatVersionV5 = 5'u16
+    ## Format with seat labels and the original Polyworld tape layout.
+  ReplayFormatVersion* = 6'u16
+    ## Shared Polyworld tapes include match config and omit creation time.
   ReplayGameVersion* = 38'u16
     ## Physics the *viewer* runs. Observatory's static wasm must ship at
     ## this same number as the recording image (`pwcoworld`). Load and
@@ -174,6 +176,7 @@ const
   MaxReplayActions* = 10_000_000
   MaxReplayHashes* = 100_000_000
   MaxReplayPudges* = 32
+  MaxConfigNameBytes = 4096
   BugTapeDir* = "duels"
     ## Cwd-relative folder for named mid-match bug tapes (repo-root
     ## `duels/` when launched via host_party.sh / duel.sh).
@@ -237,9 +240,20 @@ type
     first*: int32
     second*: int32
 
+  LegacyReplayHeader[Setup] = object
+    formatVersion*: uint16
+    gameVersion*: uint16
+    createdUnixMs*: int64
+    setup*: Setup
+
+  LegacyReplayData[Setup] = object
+    header*: LegacyReplayHeader[Setup]
+    actions*: seq[ReplayAction]
+    hashes*: seq[uint64]
+
   ReplayHeader* = TapeHeader[Setup]
   ReplayData* = ActionTape[Setup, ReplayAction]
-  ReplayDataV4* = ActionTape[SetupV4, ReplayAction]
+  ReplayDataV4* = LegacyReplayData[SetupV4]
   ReplayRecorder* = TapeRecorder[Setup, ReplayAction]
   ReplayPlayer* = TapePlayer[Setup, ReplayAction]
 
@@ -252,19 +266,25 @@ proc validKind(kind: uint8): bool =
 
 proc initReplayData*(setup: Setup): ReplayData =
   ## Creates an empty replay with a versioned deterministic setup.
-  initActionTape[Setup, ReplayAction](
+  result = initActionTape[Setup, ReplayAction](
     setup,
     ReplayFormatVersion,
     ReplayGameVersion
   )
+  result.config = GameConfig(
+    players: unnamedPlayers(min(setup.pudges.len, MaxPudgeCount)),
+    seed: setup.mapSeed,
+    maxTicks: cast[int32](setup.maximumTicks)
+  )
+  for i in 0 ..< min(setup.seatLabels.len, result.config.players.len):
+    let label = setup.seatLabels[i]
+    # Setup retains even labels too long for shared player records.
+    if label.len in 1 .. MaxConfigNameBytes:
+      result.config.players[i].name = label
 
 proc initReplayRecorder*(setup: Setup): ReplayRecorder =
   ## Creates an in-memory Pudge Wars action recorder.
-  initTapeRecorder[Setup, ReplayAction](
-    setup,
-    ReplayFormatVersion,
-    ReplayGameVersion
-  )
+  ReplayRecorder(data: initReplayData(setup))
 
 proc record*(recorder: ReplayRecorder, action: ReplayAction) =
   ## Appends one bot action in deterministic tick order.
@@ -582,6 +602,10 @@ proc validate*(data: ReplayData) =
     fail("replay setup must list a 1v1 to 5v5 roster")
   if setup.seatLabels.len != 0 and setup.seatLabels.len != setup.pudges.len:
     fail("replay setup seat labels must match the roster")
+  data.config.validateConfig(setup.pudges.len)
+  if data.config.seed != setup.mapSeed or
+    data.config.maxTicks != int32(setup.maximumTicks):
+      fail("replay configuration does not match the match setup")
   if data.actions.len > MaxReplayActions:
     fail("replay action limit exceeded")
   if data.hashes.len > MaxReplayHashes:
@@ -632,47 +656,82 @@ proc encodeReplay*(data: ReplayData): string =
     MaxReplayBytes
   )
 
-proc upgradeReplayV4(old: ReplayDataV4): ReplayData =
-  ## Format v4 → v5 with empty seat labels (P1..Pn fallback).
-  result.header.formatVersion = ReplayFormatVersion
-  result.header.gameVersion = old.header.gameVersion
-  result.header.createdUnixMs = old.header.createdUnixMs
-  result.header.setup = Setup(
-    mapSeed: old.header.setup.mapSeed,
-    mapHash: old.header.setup.mapHash,
-    tickRate: old.header.setup.tickRate,
-    gridTiles: old.header.setup.gridTiles,
-    maximumTicks: old.header.setup.maximumTicks,
-    killGoal: old.header.setup.killGoal,
-    botEvery: old.header.setup.botEvery,
-    botAimNoise: old.header.setup.botAimNoise,
-    runePeriod: old.header.setup.runePeriod,
-    pudges: old.header.setup.pudges,
-    seatLabels: @[]
-  )
+proc upgradeReplay[LegacySetup](
+    old: LegacyReplayData[LegacySetup]
+): ReplayData =
+  ## Upgrades the original Polyworld tape and fills its shared match config.
+  when LegacySetup is SetupV4:
+    let setup = old.header.setup
+    result = initReplayData(Setup(
+      mapSeed: setup.mapSeed,
+      mapHash: setup.mapHash,
+      tickRate: setup.tickRate,
+      gridTiles: setup.gridTiles,
+      maximumTicks: setup.maximumTicks,
+      killGoal: setup.killGoal,
+      botEvery: setup.botEvery,
+      botAimNoise: setup.botAimNoise,
+      runePeriod: setup.runePeriod,
+      pudges: setup.pudges
+    ))
+  else:
+    result = initReplayData(old.header.setup)
   result.actions = old.actions
   result.hashes = old.hashes
 
-proc decodeReplay*(bytes: string): ReplayData =
-  ## Decodes and validates one Pudge Wars replay buffer.
-  ## Format v4 tapes load with empty seat labels.
-  let payload = replayFilePayload(
-    bytes,
-    ReplayGame,
-    ReplayGameVersion,
-    MaxReplayBytes
-  )
-  if payload.len < 2:
-    fail("replay payload is truncated")
-  let formatVersion =
-    uint16(payload[0].ord) or (uint16(payload[1].ord) shl 8)
+proc decodeLegacyReplay(
+    bytes: string, offset: int, formatVersion: uint16
+): ReplayData =
+  ## Converts an outer v1 replay to the current in-memory layout.
+  var cursor = offset
   case formatVersion
   of ReplayFormatVersionV4:
-    result = upgradeReplayV4(payload.fromFlatty(ReplayDataV4))
-  of ReplayFormatVersion:
-    result = payload.fromFlatty(ReplayData)
+    var old: ReplayDataV4
+    bytes.fromFlatty(cursor, old)
+    result = old.upgradeReplay()
+  of ReplayFormatVersionV5:
+    var old: LegacyReplayData[Setup]
+    bytes.fromFlatty(cursor, old)
+    result = old.upgradeReplay()
   else:
-    fail("unsupported replay format version")
+    fail("unsupported legacy replay format version " & $formatVersion)
+
+proc decodeReplay*(bytes: string): ReplayData =
+  ## Decodes and validates current and gameplay-compatible legacy tapes.
+  if bytes.len > MaxReplayBytes:
+    fail("replay exceeds the file size limit")
+  let header = bytes.replayFileHeader()
+  if header.formatVersion notin {LegacyReplayFileVersion, ReplayFileVersion}:
+    fail(
+      "unsupported Polyworld replay format version " & $header.formatVersion
+    )
+  if header.game != ReplayGame:
+    fail(
+      "replay belongs to '" & header.game & "', expected '" & ReplayGame & "'"
+    )
+  if header.gameVersion != ReplayGameVersion:
+    fail("unsupported replay game version " & $header.gameVersion)
+  let offset = ReplayMagic.len + ReplayFileFixedBytes + header.game.len
+  if bytes.len - offset < 4:
+    fail("replay payload header is truncated")
+  let
+    formatVersion = uint16(bytes[offset].ord) or
+      (uint16(bytes[offset + 1].ord) shl 8)
+    gameVersion = uint16(bytes[offset + 2].ord) or
+      (uint16(bytes[offset + 3].ord) shl 8)
+  if gameVersion != ReplayGameVersion:
+    fail("unsupported replay payload game version " & $gameVersion)
+  try:
+    if header.formatVersion == LegacyReplayFileVersion:
+      result = decodeLegacyReplay(bytes, offset, formatVersion)
+    else:
+      if formatVersion != ReplayFormatVersion:
+        fail("unsupported replay format version " & $formatVersion)
+      result = decodeReplayFile(
+        ReplayGame, ReplayGameVersion, bytes, ReplayData, MaxReplayBytes
+      )
+  except FlattyError, IndexDefect:
+    fail("invalid replay payload: " & getCurrentExceptionMsg())
   result.validate()
 
 proc saveReplay*(path: string, data: ReplayData) =

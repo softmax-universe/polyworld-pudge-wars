@@ -1,0 +1,35 @@
+name: Build Pudge Wars episode image
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build local episode image
+        run: >-
+          docker buildx build --load --platform linux/amd64 --build-context engine=.
+          --file coworld/Dockerfile --tag coworld-pudgewars:latest coworld
+      - name: Run a staged episode without network access
+        run: |
+          export PUDGE_EPISODE_OUTPUT="$RUNNER_TEMP/pudge-episode"
+          binary="$RUNNER_TEMP/pwleague"
+          cat > "$binary" <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          exec docker run --rm --network none --user "$(id -u):$(id -g)" \
+            --volume "$PUDGE_EPISODE_OUTPUT:$PUDGE_EPISODE_OUTPUT" \
+            --env COGAME_CONFIG_URI --env COGAME_PLAYER_SEATS_URI \
+            --env COGAME_RESULTS_URI --env COGAME_SAVE_REPLAY_URI \
+            --env COGAME_PLAYER_FAILURE_URI --env COGAME_LLM \
+            coworld-pudgewars:latest
+          SH
+          chmod +x "$binary"
+          python3 scripts/run_episode.py base aggressive --ticks 128 \
+            --output "$PUDGE_EPISODE_OUTPUT" --binary "$binary"

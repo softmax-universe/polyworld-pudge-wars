@@ -8,11 +8,11 @@ sanity-check with `squad_spar.sh`. Notes live in `squad/NOTES.md`.
 
 ---
 
-# Hosted WASM lobby (implement this first if that is the task)
+# Browser and multiplayer work
 
-If the session is **hosted play / pudgewars.com / play sessions / prediction-rollback**,
-read [`HOSTED_PLAY_SESSION.md`](HOSTED_PLAY_SESSION.md) end to end and ignore
-the challenger protocol below. Do not change `players/challenger.bas` for that work.
+For browser builds, relay rooms and invitations, use the
+[browser multiplayer runbook](../../docs/hosted-browser-client.md). Use the [local episode guide](../../coworld/GAME_HOSTED_MIGRATION.md) for BASIC
+policy evaluation and replay verification.
 
 ---
 

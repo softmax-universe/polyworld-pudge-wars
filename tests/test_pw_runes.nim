@@ -5,7 +5,7 @@
 import
   bassy,
   std/os,
-  polyworld/[cli, tapes],
+  polyworld/[tapes], pudgewars/[cli],
   ../examples/pudge_wars/bots,
   ../examples/pudge_wars/content,
   ../examples/pudge_wars/maps,

@@ -1,10 +1,8 @@
-## Pudge Wars combat one-shots. Files live in
-## polyworld_data/sounds/pudge_wars. Display-side only; the sim never
-## hears anything. Playback is gated in graphics to the local hero and
-## the current play camera. HUD, pings, runes, and match stingers stay
-## silent. Audio starts muted.
+## Pudge Wars combat effects use Polyworld's shared device and mix settings.
 
-import content, polyworld/sounds
+import
+  polyworld/[sounddevices, sounds],
+  content
 
 type
   GameSound* = enum
@@ -24,41 +22,42 @@ const
     "kill",
     "death"
   ]
+  FirstGameSoundBuffer = SoundBufferLimit - EffectFiles.len
 
-var
-  buffers: array[GameSound, SoundBuffer]
-  audioReady = false
-
-proc loadClip(name: string): SoundBuffer =
-  let path = soundPath(name)
-  result = loadWavBuffer(path)
-  if not bufferReady(result):
-    echo "audio: missing or unreadable ", path
+static:
+  doAssert SoundClips.len <= FirstGameSoundBuffer
 
 proc initGameAudio*(muted: bool) =
-  ## Opens the device and loads the recorded set. Silent no-op
-  ## when no audio device exists.
-  if not initSounds():
-    echo "audio: no output device, staying silent"
+  ## Preloads Pudge's recordings before the shared mixer seals its buffers.
+  setSoundMuted(muted)
+  if not openSoundDevice():
     return
   for kind in GameSound:
-    buffers[kind] = loadClip(EffectFiles[kind])
-  setSoundsMuted(muted)
-  audioReady = true
+    let path = soundPath(EffectFiles[kind])
+    if not loadSoundBuffer(FirstGameSoundBuffer + kind.ord, path):
+      echo "Cannot load sound: ", path
+  initSounds()
 
 proc closeGameAudio*() =
-  audioReady = false
+  ## Releases the application's shared audio device.
   closeSounds()
 
+proc stopGameAudio*() =
+  ## Stops active effects between matches.
+  stopSounds()
+
 proc tickGameAudio*() =
-  tickSounds()
+  ## Updates the shared mixer after an audio device interruption.
+  updateSounds()
 
 proc gameAudioMuted*(): bool =
+  ## Reports the shared mute state.
   soundsMuted()
 
 proc toggleGameAudioMute*() =
-  setSoundsMuted(not soundsMuted())
+  ## Changes session mute without changing saved volume levels.
+  setSoundMuted(not soundsMuted())
 
-proc playGameSound*(kind: GameSound, gain = 1.0'f32, pitch = 1.0'f32) =
-  if audioReady:
-    playBuffer(buffers[kind], gain, pitch)
+proc playGameSound*(kind: GameSound, gain = 1.0'f) =
+  ## Plays the recorded clip using the shared effects volume.
+  discard startSoundVoice(FirstGameSoundBuffer + kind.ord, gain, 0, ui = false)

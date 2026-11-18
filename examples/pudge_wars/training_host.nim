@@ -1,20 +1,25 @@
-## Headless JSONL access to the exact Coworld match simulation and player view.
+## Headless JSONL access to the local simulation and fog-filtered player view.
 
 import std/[json, strutils]
-import polyworld/cli
+import pudgewars/cli
 import content, maps, sim, bots, replays
-import coworld_host as host
+import observations
 
-var learnerSlot: int
+var
+  learnerSlot: int
+  game: Game
+  receipt: ObservationEcho
 
 proc snapshot(): JsonNode =
-  let final = host.game.world.gameOver or host.game.world.tick >= host.maxTicks
+  ## Report the learner's current view and whether the episode has ended.
+  let final = game.world.gameOver or game.world.tick >= game.maximumTicks
   %*{
-    "observation": host.observation(learnerSlot, final),
+    "observation": observation(game, learnerSlot, receipt, final),
     "done": final
   }
 
 proc handle(request: JsonNode): JsonNode =
+  ## Reset or advance the local learner episode.
   case request["kind"].getStr
   of "reset":
     let
@@ -25,28 +30,30 @@ proc handle(request: JsonNode): JsonNode =
     learnerSlot = request["learner_slot"].getInt
     if learnerSlot < 0 or learnerSlot >= seats:
       raise newException(ValueError, "Learner slot is outside the roster")
-    host.maxTicks = int32(request["max_ticks"].getInt)
-    if host.maxTicks < 1:
-      raise newException(ValueError, "max_ticks must be positive")
-    host.fogOn = true
+    let maxTicks = request["max_ticks"].getBiggestInt
+    if maxTicks < 1 or maxTicks > high(int32):
+      raise newException(ValueError, "max_ticks must be a positive int32")
+    receipt = ObservationEcho()
     let teamSize = if seats == DuelPudgeCount: TeamSize else: seats div 2
-    host.game = newGame(
-      generateMap(seed, teamSize), host.maxTicks, false, ReplayData(),
+    game = newGame(
+      generateMap(seed, teamSize), int32(maxTicks), false, ReplayData(),
       if seats == DuelPudgeCount: DuelKillGoal else: KillGoal,
       RunePeriodTicks, seats == DuelPudgeCount
     )
-    host.game.humanSlots = @[learnerSlot]
-    loadBots(host.game, [BotGroup(
+    game.humanSlots = @[learnerSlot]
+    loadBots(game, [BotGroup(
       path: "examples/pudge_wars/players/base.bas", count: seats - 1
     )])
-    host.snapshotAccepted()
+    snapshotAccepted(game, receipt)
+    game.intentResults.setLen(0)
     result = snapshot()
   of "step":
-    if request["tick"].getInt != host.game.world.tick:
+    if request["tick"].getInt != game.world.tick:
       raise newException(ValueError, "Action belongs to another tick")
-    host.applyAction(learnerSlot, request["action"])
-    tickWorld(host.game, proc() = runBotDecisions(host.game))
-    host.snapshotAccepted()
+    applyAction(game, receipt, learnerSlot, request["action"])
+    tickWorld(game, proc() = runBotDecisions(game))
+    snapshotAccepted(game, receipt)
+    game.intentResults.setLen(0)
     result = snapshot()
   else:
     raise newException(ValueError, "Unknown training host command")
