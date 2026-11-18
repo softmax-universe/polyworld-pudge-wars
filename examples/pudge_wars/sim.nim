@@ -3091,11 +3091,12 @@ proc idleAcquireTarget(world: World, index: int): int32 =
   if best > int64(AutoAcquireRange) * int64(AutoAcquireRange):
     result = 0
 
-proc runHumanIntents*(game: Game, slot: int) =
+proc runHumanIntents*(game: Game, slot: int, autoAcquire = true): bool {.discardable.} =
   ## Drains one human seat's queued commands through the same
   ## record-then-apply path the bot host functions use, so live play,
   ## replays, and hash checks cannot diverge. After the queue is empty,
-  ## an idle butcher auto-acquires a nearby enemy (recorded on the tape).
+  ## an idle butcher can auto-acquire a nearby enemy. Reports manual orders
+  ## so a relay handoff can preserve their priority across controller batches.
   if slot < 0 or slot >= game.world.pudges.len:
     return
   let
@@ -3203,8 +3204,8 @@ proc runHumanIntents*(game: Game, slot: int) =
 
   # A fresh walk/attack/stop this turn is an instruction: do not
   # immediately re-acquire (so S is not a no-op on the same tick).
-  if sawOrder:
-    return
+  if sawOrder or not autoAcquire:
+    return sawOrder
   let acquireId = idleAcquireTarget(game.world, slot)
   if acquireId == 0:
     return

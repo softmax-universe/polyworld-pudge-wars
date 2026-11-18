@@ -3,7 +3,7 @@ import
   std/[os, strutils],
   windy,
   polyworld/connections,
-  ../examples/pudge_wars/[multiplayer, replays, sim]
+  ../examples/pudge_wars/[content, multiplayer, replays, sim]
 
 const
   West = 0
@@ -54,7 +54,7 @@ config.teamSize = 2
 config.maxTicks = int32(3 * NetworkTickRate)
 config.runePeriod = 17
 westClient.send(RoomMessage(
-  kind: CreateRoom, name: "Pudge Wars socket QA", number: 4,
+  kind: CreateRoom, name: "Pudge Wars socket QA", number: MaxPudgeCount,
   tickRate: uint32(NetworkTickRate), payload: config.encodeConfig()
 ))
 awaitState(westClient.snapshot.room.len > 0, "Owner did not create the room")
@@ -62,29 +62,28 @@ let room = westClient.snapshot.room
 eastClient.send(RoomMessage(kind: JoinRoom, room: room))
 awaitState(eastClient.snapshot.room == room, "Guest did not join the room")
 westClient.claimHuman(0)
-westClient.send(RoomMessage(kind: ClaimSeat, seat: 1, name: "West socket bot"))
-eastClient.claimHuman(2)
-eastClient.send(RoomMessage(kind: ClaimSeat, seat: 3, name: "East socket bot"))
+westClient.send(RoomMessage(
+  kind: ClaimSeat, seat: 1, seatKind: BotSeat, name: "West socket bot"
+))
+eastClient.claimHuman(5)
+eastClient.send(RoomMessage(
+  kind: ClaimSeat, seat: 6, seatKind: BotSeat, name: "East socket bot"
+))
 awaitState(
-  westClient.snapshot.seats[3].owner == eastClient.participant and
+  westClient.snapshot.seats[6].owner == eastClient.participant and
     eastClient.snapshot.seats[1].owner == westClient.participant and
     westClient.snapshot.revision == eastClient.snapshot.revision,
   "Clients did not agree on both human and BASIC seats"
 )
 
-let sources = [
-  ["", "a = walkTo(36, 72)\na = hookTo(88, 70)", "", ""],
-  ["", "", "", "a = walkTo(95, 72)\na = hookTo(36, 70)"]
-]
+var sources: array[2, array[MaxPudgeCount, string]]
+sources[West][1] = "a = walkTo(36, 72)\na = hookTo(88, 70)"
+sources[East][6] = "a = walkTo(95, 72)\na = hookTo(36, 70)"
 
 proc prepare(index: int) =
-  ## Produces a fresh local VM and proof for one retained lobby revision.
+  ## Builds the simulation and local policies for this exact setup.
   let client = peers[index].client
   matches[index] = prepareNetworkMatch(client, sources[index])
-  client.send(RoomMessage(
-    kind: PreparedDuration, revision: matches[index].revision,
-    hash: matches[index].networkHash(), durationTicks: uint32(config.maxTicks)
-  ))
 
 proc start() =
   ## Applies both BeginMatch events using the prepared worlds.
@@ -92,6 +91,7 @@ proc start() =
     westClient.events.len == 1 and eastClient.events.len == 1,
     "Relay did not start the socket match"
   )
+  prepare(East)
   for i, connection in peers:
     matches[i].start(connection.client.events[0])
     connection.client.events.setLen(0)
@@ -102,15 +102,14 @@ proc saw(match: NetworkMatch, pudgeId: int32, kind: uint8): bool =
     if action.pudgeId == pudgeId and action.kind == kind:
       return true
 
-echo "Checking socket start with automatic preparation"
-westClient.send(RoomMessage(kind: StartMatch))
+echo "Checking socket start from the immutable generic setup hash"
 prepare(West)
-for pass in 0 ..< 5:
-  frame()
-doAssert westClient.snapshot.phase == Lobby
-prepare(East)
-doAssert matches[West].networkHash() == matches[East].networkHash()
+westClient.send(matches[West].startRequest())
 start()
+awaitState(
+  not westClient.catchingUp and not eastClient.catchingUp,
+  "Clients did not confirm their initial live edge"
+)
 let
   westMatch = matches[West]
   eastMatch = matches[East]
@@ -163,9 +162,8 @@ awaitState(
 )
 westMatch.close()
 eastMatch.close()
-for i in West .. East:
-  prepare(i)
-westClient.send(RoomMessage(kind: StartMatch))
+prepare(West)
+westClient.send(matches[West].startRequest())
 start()
 doAssert westClient.match == firstMatch + 1
 awaitState(

@@ -2,8 +2,10 @@
 
 Run the commands from the Pudge Wars checkout. `scripts/setup.sh` installs Nim
 2.2.10 and the packages pinned in `nimby.lock`. The validated shared engine is
-`7b014a3e8a3bdef4d34fdd8b6debb94786245447`, published on Polyworld's
-`pudge-relay-multiplayer` branch. For engine development, optionally point
+`3cc3a0650008533a1200142bc527a0b9226c7682`, published on Polyworld's
+`pudge-shared-infrastructure-pr` branch. Its relay and room protocol sources
+are unchanged from the generic upstream relay at `a8cd9868`. The additional
+engine changes are client, rendering, and build helpers. For development, optionally point
 `PUDGEWARS_POLYWORLD` at a checkout of that revision before setup and builds.
 Setup then uses that engine and installs the remaining locked packages.
 

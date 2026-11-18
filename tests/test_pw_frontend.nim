@@ -1,7 +1,7 @@
 import
   std/strutils,
   polyworld/rooms,
-  ../examples/pudge_wars/[content, homes, lobbies]
+  ../examples/pudge_wars/[content, homes, lobbies, presets]
 
 echo "Pudge Wars player and room names"
 doAssert not confirmedPlayerName("")
@@ -31,23 +31,43 @@ for invalid in ["", "https://play.test?server=local", "room\n42", repeat('X', 65
     discard
 
 echo "Pudge Wars seat cards retain their bank and position across resizing"
-for before in 1 .. MaxTeamSize:
-  for after in 1 .. MaxTeamSize:
-    for seat in 0 ..< before * 2:
-      let card = displaySeat(seat, before)
-      doAssert lobbySeat(card, before) == seat
-      let resized = lobbySeat(card, after)
-      if seat mod before >= after:
-        doAssert resized == -1
-      else:
-        doAssert resized div after == seat div before
-        doAssert resized mod after == seat mod before
+var config = defaultConfig()
+for teamSize in 1 .. MaxTeamSize:
+  config.teamSize = teamSize
+  doAssert not config.seatEnabled(-1)
+  doAssert not config.seatEnabled(MaxPudgeCount)
+  for i in 0 ..< MaxTeamSize:
+    let enabled = i < teamSize
+    doAssert config.seatEnabled(i) == enabled
+    doAssert config.seatEnabled(i + MaxTeamSize) == enabled
 
 echo "Both banks can start with sparse seats"
-let seats = [Seat(owner: 1), Seat(), Seat(), Seat(), Seat(), Seat(owner: 2)]
-doAssert opposingBanks(seats, 3)
-doAssert not opposingBanks(seats[0 .. 4], 3)
-doAssert not opposingBanks([Seat(), Seat(owner: 2)], 1)
+var seats: array[MaxPudgeCount, Seat]
+seats[0] = Seat(owner: 1, kind: HumanSeat, name: "Pudge")
+seats[6] = Seat(owner: 2, kind: BotSeat, name: "Human")
+config.teamSize = 2
+doAssert config.opposingBanks(seats)
+doAssert config.excludedSeat(seats) == -1
+config.teamSize = 1
+doAssert not config.opposingBanks(seats)
+doAssert config.excludedSeat(seats) == 6
+
+echo "A claim racing a bank shrink must be cleared or included again"
+seats[5] = Seat(owner: 3, kind: HumanSeat, name: "East player")
+doAssert config.opposingBanks(seats)
+doAssert config.excludedSeat(seats) == 6
+try:
+  config.validateRoster(seats)
+  doAssert false, "An occupied inactive seat cannot start a match"
+except RoomsError:
+  discard
+config.teamSize = 2
+config.validateRoster(seats)
+doAssert config.excludedSeat(seats) == -1
+config.teamSize = 1
+seats[6] = Seat()
+doAssert config.excludedSeat(seats) == -1
+config.validateRoster(seats)
 
 when not defined(headless):
   import std/tables, silky

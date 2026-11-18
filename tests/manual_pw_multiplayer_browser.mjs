@@ -5,8 +5,8 @@ import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
 const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
-const bundleUrl = process.env.PUDGEWARS_BROWSER_URL || 'http://127.0.0.1:8719/';
-const relayUrl = process.env.PUDGEWARS_RELAY_URL || 'ws://127.0.0.1:8092/ws';
+const bundleUrl = process.env.PUDGEWARS_BROWSER_URL || 'http://127.0.0.1:8080/';
+const relayUrl = process.env.PUDGEWARS_RELAY_URL || 'ws://127.0.0.1:8090/ws';
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 async function until(label, predicate, timeout = 25000) {
@@ -16,10 +16,20 @@ async function until(label, predicate, timeout = 25000) {
     await delay(100);
   }
 }
-const kinds = 'Hello Welcome ListRooms RoomList CreateRoom JoinRoom RoomState ConfigureRoom ClaimSeat ReleaseSeat Ready StartMatch BeginMatch SubmitCommand CommandAck TickPacket AppliedTick Catchup CaughtUp ReportHash MatchStatus LeaveRoom KickParticipant ReturnLobby FinishMatch Received Keepalive Failure AbortMatch PauseMatch ResizeRoom Prepared ReadyStatus PreparedDuration ServerNotice'.split(' ');
+const RoomProtocolVersion = 5;
+const HumanSeat = 0;
+const ActionRotToggle = 17;
+const kinds = (
+  'Hello Welcome ListRooms RoomList CreateRoom JoinRoom RoomState ConfigureRoom ' +
+  'ClaimSeat ReleaseSeat StartMatch BeginMatch SubmitCommand CommandAck TickPacket ' +
+  'AppliedTick Catchup CaughtUp ReportHash MatchStatus LeaveRoom KickParticipant ' +
+  'ReturnLobby FinishMatch Received Keepalive Failure AbortMatch PauseMatch ResizeRoom ReadyStatus'
+).split(' ');
 function decode(data) {
   const b = Buffer.isBuffer(data) ? data : Buffer.from(data);
-  if (b.length < 64 || b.toString('ascii', 0, 4) !== 'PWRM') return {};
+  assert.ok(b.length >= 64 && b.toString('ascii', 0, 4) === 'PWRM',
+    'Expected a Polyworld relay packet');
+  assert.equal(b.readUInt32LE(4), RoomProtocolVersion);
   let i = 64;
   const u = () => { const n = b.readUInt32LE(i); i += 4; return n; };
   const wide = () => { const n = b.readBigUInt64LE(i).toString(); i += 8; return n; };
@@ -27,8 +37,11 @@ function decode(data) {
   const str = () => bytes().toString('utf8');
   const packet = { kind: kinds[b.readUInt32LE(8)], match: b.readUInt32LE(20) };
   const action = () => { const payload = bytes(); return payload.length < 4 ? -1 : payload.readUInt32LE(0); };
+  const seats = () => Array.from({ length: u() }, () => ({
+    owner: u(), kind: u(), name: str()
+  }));
   if (packet.kind === 'Welcome') packet.participant = u();
-  if (packet.kind === 'RoomState') {
+  if (packet.kind === 'RoomState' || packet.kind === 'BeginMatch') {
     packet.room = str();
     packet.name = str();
     packet.owner = u();
@@ -40,16 +53,25 @@ function decode(data) {
     packet.participants = Array.from({ length: u() }, () => ({
       id: u(), name: str(), connected: u(), ready: u()
     }));
-    packet.seats = Array.from({ length: u() }, () => ({ owner: u(), name: str() }));
+    packet.seats = seats();
+    if (packet.kind === 'BeginMatch') packet.hash = wide();
+  }
+  if (packet.kind === 'StartMatch') {
+    packet.revision = u();
+    packet.hash = wide();
   }
   if (packet.kind === 'SubmitCommand') {
-    packet.seat = u(); packet.sequence = wide(); packet.action = action();
+    packet.seat = u();
+    packet.seatKind = u();
+    packet.sequence = wide();
+    packet.action = action();
   }
   if (packet.kind === 'TickPacket') {
     packet.tick = u();
     packet.commands = Array.from({ length: u() }, () => ({
-      participant: u(), seat: u(), sequence: wide(), action: action()
+      participant: u(), seat: u(), seatKind: u(), sequence: wide(), action: action()
     }));
+    packet.seats = seats();
   }
   if (packet.kind === 'ReportHash') { packet.tick = u(); packet.hash = wide(); }
   if (packet.kind === 'PauseMatch') packet.flag = u();
@@ -74,7 +96,8 @@ function decode(data) {
       socket.on('framesent', (event) => peer.sent.push(decode(event.payload)));
       socket.on('framereceived', (event) => peer.received.push(decode(event.payload)));
     });
-    peer.room = () => peer.received.filter((packet) => packet.kind === 'RoomState').at(-1);
+    peer.room = () => peer.received.findLast((packet) => packet.kind === 'RoomState');
+    peer.participant = () => peer.received.find((packet) => packet.kind === 'Welcome')?.participant;
     peer.click = async (x, y) => {
       await page.bringToFront();
       await page.mouse.move(x, y);
@@ -109,40 +132,63 @@ function decode(data) {
   try {
     const west = await createPeer('Arena Input QA Host');
     await west.click(640, 518);
-    await until('host WebSocket Welcome', () => west.received.some((packet) => packet.kind === 'Welcome'));
+    await until('host WebSocket Welcome', () => west.participant() > 0);
     await west.click(1043, 459);
-    await until('host creates a room', () => west.room()?.room && west.room().seats[0]?.owner > 0);
+    await until('host creates a room with a human seat', () =>
+      west.room()?.room && west.room().seats[0]?.owner === west.participant() &&
+      west.room().seats[0].kind === HumanSeat);
     console.log('Room created', west.room().room);
     const east = await createPeer('Arena Input QA Guest', west.room().room);
-    await until('guests joined same room', () => east.room()?.seats[1]?.owner > 0);
+    await until('guest takes a human seat in the same room', () =>
+      east.room()?.room === west.room().room &&
+      east.room().seats[1]?.owner === east.participant() &&
+      east.room().seats[1].kind === HumanSeat);
     await east.click(550, 221);
     await east.click(645, 292);
-    await until('guest moved across the river',
-      () => east.room()?.seats[3]?.owner > 0 &&
-        east.room().seats[0].owner !== east.room().seats[3].owner);
+    await until('both peers observe the guest moving across the river', () =>
+      [west, east].every((peer) =>
+        peer.room()?.seats[0]?.owner === west.participant() &&
+        peer.room().seats[1]?.owner === 0 &&
+        peer.room().seats[3]?.owner === east.participant() &&
+        peer.room().seats[3].kind === HumanSeat) &&
+      west.room().revision === east.room().revision);
     console.log('Guest moved to East');
-    await until('both seats prove the lobby revision', () =>
-      [west, east].every((peer) => peer.sent.some((packet) => packet.kind === 'PreparedDuration')));
     await west.click(1142, 754);
+    await until('owner starts the accepted revision', () =>
+      west.sent.some((packet) => packet.kind === 'StartMatch'));
+    const start = west.sent.find((packet) => packet.kind === 'StartMatch');
+    await until('both peers receive the same immutable setup', () =>
+      [west, east].every((peer) => peer.received.some((packet) =>
+        packet.kind === 'BeginMatch' && packet.revision === start.revision &&
+        packet.hash === start.hash && packet.seats[0]?.owner === west.participant() &&
+        packet.seats[3]?.owner === east.participant())));
     await until('both clients render live network ticks',
       () => west.reports.at(-1)?.tick >= 12 && east.reports.at(-1)?.tick >= 12, 45000);
     console.log('Both arenas running', west.reports.at(-1).tick, east.reports.at(-1).tick);
 
     await west.key('r');
     await east.key('r');
-    await until('both human owners submit R commands',
-      () => [west, east].every((peer) => peer.sent.some((packet) =>
-        packet.kind === 'SubmitCommand' && packet.action === 17)));
-    const submissions = [west, east].map((peer) => peer.sent.find((packet) =>
-      packet.kind === 'SubmitCommand' && packet.action === 17));
-    assert.notEqual(submissions[0].seat, submissions[1].seat);
-    await until('both clients receive the same two Rot commands',
+    const submittedRot = (peer) => peer.sent.find((packet) =>
+      packet.kind === 'SubmitCommand' && packet.seatKind === HumanSeat &&
+      packet.action === ActionRotToggle);
+    await until('both human owners submit R commands', () =>
+      [west, east].every(submittedRot));
+    const submissions = [west, east].map((peer) => ({
+      ...submittedRot(peer), participant: peer.participant()
+    }));
+    assert.deepEqual(submissions.map((input) => input.seat), [0, 3]);
+    const confirmedRot = (peer, input) => peer.received.find((packet) =>
+      packet.seats?.[input.seat]?.owner === input.participant &&
+      packet.seats[input.seat].kind === HumanSeat &&
+      packet.commands?.some((command) =>
+        command.participant === input.participant && command.seat === input.seat &&
+        command.seatKind === HumanSeat && command.sequence === input.sequence &&
+        command.action === ActionRotToggle));
+    await until('both clients receive the same two authorized Rot commands',
       () => [west, east].every((peer) => submissions.every((input) =>
-        peer.received.some((packet) => packet.commands?.some((command) =>
-          command.seat === input.seat && command.sequence === input.sequence && command.action === 17)))));
+        confirmedRot(peer, input))));
     const lastInputTick = Math.max(...submissions.map((input) =>
-      west.received.find((packet) => packet.commands?.some((command) =>
-        command.seat === input.seat && command.sequence === input.sequence)).tick));
+      confirmedRot(west, input).tick));
     await until('clients report equal authoritative hashes after input',
       () => west.sent.some((a) => a.kind === 'ReportHash' && a.tick >= lastInputTick &&
         east.sent.some((b) => b.kind === 'ReportHash' && b.tick === a.tick && b.hash === a.hash)));
@@ -160,13 +206,29 @@ function decode(data) {
       east.received.some((packet) => packet.kind === 'MatchStatus' && packet.flag === 0 && packet.phase === 1));
     console.log('Resume propagated through relay');
     await west.click(641, 466);
-    await until('quit aborts active match for all peers', () =>
-      west.sent.some((packet) => packet.kind === 'AbortMatch') &&
-      east.received.some((packet) => packet.kind === 'MatchStatus' && packet.phase === 4));
-    await until('host leaves the aborted match', () => west.sent.some((packet) => packet.kind === 'LeaveRoom'));
-    assert.deepEqual(west.errors, []);
-    assert.deepEqual(east.errors, []);
-    console.log('Pause, resume, and quit propagated through relay');
+    await until('host leaves the live room', () =>
+      west.sent.some((packet) => packet.kind === 'LeaveRoom') &&
+      west.room()?.room === '');
+    const vacancy = () => east.received.find((packet) =>
+      packet.kind === 'TickPacket' && packet.seats[0]?.owner === 0 &&
+      packet.seats[3]?.owner === east.participant() &&
+      packet.seats[3].kind === HumanSeat);
+    await until('guest receives the released seat in an authoritative tick', vacancy);
+    await until('guest keeps playing after the host leaves', () =>
+      east.reports.some((report) => report.phase === 'live' && report.tick > vacancy().tick));
+
+    await east.key('Escape');
+    await east.click(641, 466);
+    await until('guest leaves the live room', () =>
+      east.sent.some((packet) => packet.kind === 'LeaveRoom') &&
+      east.room()?.room === '');
+    for (const peer of [west, east]) {
+      assert.ok(!peer.sent.some((packet) => packet.kind === 'AbortMatch'));
+      assert.ok(!peer.received.some((packet) =>
+        packet.kind === 'MatchStatus' && packet.phase === 4));
+      assert.deepEqual(peer.errors, []);
+    }
+    console.log('Leaving released seats while the remaining player stayed live');
   } finally {
     await browser.close();
   }

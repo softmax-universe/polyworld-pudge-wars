@@ -1,7 +1,7 @@
 import
   std/[strutils, unicode, uri],
   polyworld/rooms,
-  content, homes
+  content, homes, presets
 
 proc defaultRoomName*(name: string): string =
   ## Gives named players an editable starting room title.
@@ -11,23 +11,20 @@ proc roomNameValid*(name: string): bool =
   ## Validates names before sending a create or configure request.
   name.len <= 96 and name.validName and name.validateUtf8 == -1
 
-proc displaySeat*(seat, teamSize: int): int =
-  ## Maps the relay's contiguous roster to the shared five-row bank cards.
-  seat div teamSize * MaxTeamSize + seat mod teamSize
-
-proc lobbySeat*(seat, teamSize: int): int =
-  ## Converts a visible bank card into its index in the current room revision.
-  if seat notin 0 ..< MaxPudgeCount or seat mod MaxTeamSize >= teamSize:
-    return -1
-  seat div MaxTeamSize * teamSize + seat mod MaxTeamSize
-
-proc opposingBanks*(seats: openArray[Seat], teamSize: int): bool =
-  ## Requires at least one controller for each bank before starting.
+proc opposingBanks*(config: MatchConfig, seats: openArray[Seat]): bool =
+  ## Requires an active butcher on each side before enabling Start.
   var occupied: array[2, bool]
   for i, seat in seats:
-    if i < teamSize * 2 and seat.owner != 0:
-      occupied[i div teamSize] = true
+    if seat.owner != 0 and config.seatEnabled(i):
+      occupied[i div MaxTeamSize] = true
   occupied[0] and occupied[1]
+
+proc excludedSeat*(config: MatchConfig, seats: openArray[Seat]): int =
+  ## Finds an assignment that would be hidden by the drafted bank size.
+  for i, seat in seats:
+    if seat.owner != 0 and not config.seatEnabled(i):
+      return i
+  -1
 
 proc parseInvite*(input: string): tuple[server, room: string] =
   ## Accepts a room code or the same invite links shared by the room UI.
@@ -52,7 +49,7 @@ when not defined(headless):
     bumpy, chroma, silky, vmath, windy,
     polyworld/[connections, roomclients],
     polyworld/lobbies as sharedLobbies,
-    maps, presets
+    maps
 
   export sharedLobbies
 
@@ -124,8 +121,7 @@ when not defined(headless):
         watching = room.phase != rooms.Lobby or full
       sk.lobbyPanel(point, vec2(rowsSize.x - 16, 60), true)
       sk.lobbyLabel(room.name, point + vec2(12, 10), 365, "LobbyBold")
-      sk.lobbyLabel($room.occupied & " / " & $room.seats,
-        point + vec2(390, 10), 130)
+      sk.lobbyLabel($room.occupied, point + vec2(390, 10), 130)
       sk.lobbyIcon("status", point + vec2(540, 20), 20,
         if watching: LobbyMuted else: LobbyGreen)
       sk.lobbyLabel(if room.phase != rooms.Lobby: $room.phase
@@ -186,8 +182,8 @@ when not defined(headless):
     sk.lobbyLabel("EAST BANK", east + vec2(70, 22), 280,
       "LobbyHeading", LobbyBlue)
 
-  proc removeBotDialog*(sk: Silky, window: Window, name: string): SlotChoice =
-    ## Confirms the host's request to clear another participant's bot.
+  proc removeSeatDialog*(sk: Silky, window: Window, seat: Seat): SlotChoice =
+    ## Confirms the host's request to clear another controller's slot.
     let
       view = window.size.vec2 / sk.uiScale
       size = vec2(520, 152)
@@ -196,9 +192,11 @@ when not defined(headless):
     sk.drawRect(vec2(0), view, rgbx(0, 0, 0, 180))
     discard sk.interact(rect(vec2(0), view), true)
     sk.lobbyPanel(at, size)
-    sk.lobbyLabel("Remove " & name & "?", at + vec2(24, 20), 472,
-      "LobbyHeading")
-    if sk.lobbyButton("Remove bot", at + vec2(24, 84), 226, "minus"):
+    let title =
+      if seat.kind == BotSeat: "Remove " & seat.name & "?"
+      else: "Clear this human seat?"
+    sk.lobbyLabel(title, at + vec2(24, 20), 472, "LobbyHeading")
+    if sk.lobbyButton("Clear slot", at + vec2(24, 84), 226, "minus"):
       result = SlotChoice(chosen: true, clear: true)
     elif sk.lobbyButton("Cancel", at + vec2(270, 84), 226, "arrow_left") or
       window.buttonPressed[KeyEscape]:

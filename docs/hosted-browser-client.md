@@ -4,6 +4,18 @@ The browser loads a static WebAssembly bundle. The shared Polyworld gameserver
 relays multiplayer rooms for both browser and native clients. The game client
 runs the match simulation and any BASIC policies assigned to its seats.
 
+The relay routes opaque setup bytes, typed seat assignments, and commands using
+Polyworld room protocol 5. Pudge's bank layout, valid starting roster, private
+policies, match duration, and command semantics are checked by the game client.
+The server has no Pudge-specific rules or code. Ready is a cosmetic status;
+the owner starts the exact current room setup without a readiness gate.
+
+Ten stable routing slots reserve five positions per bank. The selected bank
+size controls which positions can start the match. Occupied initial slots keep
+their butcher when control changes; a newly occupied slot enters gameplay on
+the next match. Leaving a running match releases its seats and other players
+continue. An invalid command or failed policy stops the match explicitly.
+
 ## Run locally
 
 Follow [Build and run Pudge Wars](building.md) to build and serve the browser

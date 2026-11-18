@@ -20,7 +20,6 @@ type
     applying, claiming, joined, leaving: bool
     policies: array[MaxPudgeCount, LocalPolicy]
     prepared: NetworkMatch
-    attemptedRevision, proofRevision: uint32
 
 when defined(emscripten):
   proc presentationReady() {.
@@ -33,21 +32,20 @@ when defined(emscripten):
   """.}
 
 proc seats(setup: Setup, name: string): seq[Seat] =
-  ## Produces the same compact bank-indexed roster accepted by the relay.
-  result.setLen(setup.config.teamSize * 2)
+  ## Preserves the same West and East slot IDs offline and online.
+  result.setLen(MaxPudgeCount)
   for i in 0 ..< result.len:
-    let card = i.displaySeat(setup.config.teamSize)
-    if card == setup.human:
-      result[i] = Seat(owner: 1, name: name)
-    elif setup.policies[card].bytes.len > 0:
-      result[i] = Seat(owner: 1, name: setup.policies[card].name)
+    if not setup.config.seatEnabled(i):
+      continue
+    if i == setup.human:
+      result[i] = Seat(owner: 1, kind: HumanSeat, name: name)
+    elif setup.policies[i].bytes.len > 0:
+      result[i] = Seat(owner: 1, kind: BotSeat, name: setup.policies[i].name)
 
-proc sources(policies: array[MaxPudgeCount, LocalPolicy],
-    teamSize: int): seq[string] =
-  ## Keeps private policy bytes with their bank when the room is resized.
-  result.setLen(teamSize * 2)
-  for i in 0 ..< result.len:
-    result[i] = policies[i.displaySeat(teamSize)].bytes
+proc sources(policies: array[MaxPudgeCount, LocalPolicy]): array[MaxPudgeCount, string] =
+  ## Keeps policy source private and indexed by stable seat ID.
+  for i, policy in policies:
+    result[i] = policy.bytes
 
 proc discardPreparation(lobby: var RoomLobby) =
   ## Frees local bot runtimes belonging to an abandoned preparation.
@@ -73,8 +71,9 @@ proc observe(lobby: var RoomLobby, client: RoomClient) =
       lobby.accepted.config
     else:
       snapshot.payload.parseConfig()
-  if config.teamSize * 2 != snapshot.seats.len:
-    reject("The room roster does not match its bank size")
+  if snapshot.phase == rooms.Lobby and not client.began and
+    snapshot.seats.len != MaxPudgeCount:
+      reject("The room must provide five stable seats per bank")
   lobby.payload = snapshot.payload
   let settings = RoomSettings(
     config: config, name: snapshot.name,
@@ -90,15 +89,18 @@ proc observe(lobby: var RoomLobby, client: RoomClient) =
   if not client.welcomed:
     lobby.claiming = false
     lobby.applying = false
-    lobby.proofRevision = 0
-    lobby.attemptedRevision = 0
+    lobby.leaving = false
+    lobby.discardPreparation()
+  elif not client.began and lobby.prepared != nil and
+    lobby.prepared.revision != snapshot.revision:
+      lobby.discardPreparation()
 
 proc claimArrival(lobby: var RoomLobby, client: RoomClient) =
   ## Claims one open human seat on arrival and preserves later seat choices.
   if lobby.joined or lobby.leaving or not client.welcomed:
     return
   let snapshot = client.snapshot
-  if snapshot.phase != rooms.Lobby:
+  if client.began or snapshot.phase != rooms.Lobby:
     lobby.joined = true
     return
   for seat in snapshot.seats:
@@ -108,42 +110,11 @@ proc claimArrival(lobby: var RoomLobby, client: RoomClient) =
   if lobby.claiming:
     return
   for i, seat in snapshot.seats:
-    if seat.owner == 0:
+    if seat.owner == 0 and lobby.accepted.config.seatEnabled(i):
       client.claimHuman(i)
       lobby.claiming = true
       return
   lobby.joined = true
-
-proc prepare(lobby: var RoomLobby, client: RoomClient) =
-  ## Proves the current roster automatically, without a Ready click.
-  let snapshot = client.snapshot
-  if lobby.prepared != nil and lobby.prepared.revision != snapshot.revision:
-    lobby.discardPreparation()
-  if snapshot.phase != rooms.Lobby or not client.welcomed or
-    lobby.leaving or lobby.proofRevision == snapshot.revision or
-    not snapshot.seats.opposingBanks(lobby.accepted.config.teamSize):
-      return
-  if lobby.prepared == nil:
-    if lobby.attemptedRevision == snapshot.revision:
-      return
-    let teamSize = lobby.accepted.config.teamSize
-    let local = lobby.policies.sources(teamSize)
-    var ownSeat: bool
-    for i, seat in snapshot.seats:
-      if seat.owner == client.participant:
-        ownSeat = true
-        if seat.name != HumanSeatName and local[i].len == 0:
-          return
-    if not ownSeat:
-      return
-    lobby.attemptedRevision = snapshot.revision
-    lobby.prepared = prepareNetworkMatch(client, local)
-  client.send(RoomMessage(
-    kind: PreparedDuration, revision: snapshot.revision,
-    hash: lobby.prepared.networkHash(),
-    durationTicks: uint32(lobby.accepted.config.maxTicks)
-  ))
-  lobby.proofRevision = snapshot.revision
 
 proc runDirectMatches*(present: proc(): bool) =
   ## Runs the explicit launch setup again whenever its presenter requests rematch.
@@ -240,10 +211,9 @@ proc runFrontend*() =
   local.config.botEvery = options.botEvery
   local.config.botAimNoise = min(options.botAimNoise, 128'i32)
   local.config.runePeriod = optionRunePeriod()
-  for i in 0 ..< local.config.teamSize * 2:
-    let card = i.displaySeat(local.config.teamSize)
-    if card != local.human:
-      local.policies[card] = bots[0]
+  for i in 0 ..< MaxPudgeCount:
+    if i != local.human and local.config.seatEnabled(i):
+      local.policies[i] = bots[0]
 
   while not window.closeRequested:
     when not defined(emscripten):
@@ -274,6 +244,7 @@ proc runFrontend*() =
         client.error = ""
         lobby.applying = false
         lobby.leaving = false
+        lobby.discardPreparation()
         if lobby.claiming:
           lobby.claiming = false
       try:
@@ -293,29 +264,28 @@ proc runFrontend*() =
             error = ""
           page = LobbyMenu
           lobby.claimArrival(client)
-          lobby.prepare(client)
           if client.events.len > 0 and not lobby.leaving:
             let event = client.events[0]
             client.events.delete(0)
+            if not client.began or event.match != client.match:
+              continue
             try:
               if lobby.prepared == nil or
                 lobby.prepared.revision != event.revision:
                   lobby.discardPreparation()
                   lobby.prepared = prepareNetworkMatch(
-                    client, lobby.policies.sources(lobby.accepted.config.teamSize)
+                    client, lobby.policies.sources()
                   )
-              lobby.prepared.start(event)
-              connection.pump()
               let match = lobby.prepared
               lobby.prepared = nil
               defer:
                 match.close()
+              match.start(event)
+              connection.pump()
               window.onFrame = nil
               installGame(match.game, match.humanPudgeIndex(), networked = true)
               let home = runGraphics(match, connection)
               releaseGame()
-              lobby.proofRevision = 0
-              lobby.attemptedRevision = 0
               if home:
                 connection.close()
                 connection = nil
@@ -330,7 +300,7 @@ proc runFrontend*() =
               if run != nil:
                 releaseGame()
               lobby.discardPreparation()
-              if client.began and client.snapshot.phase in {Playing, Waiting}:
+              if client.began and client.match == event.match:
                 client.send(RoomMessage(
                   kind: AbortMatch, match: event.match, detail: error
                 ))
@@ -401,7 +371,6 @@ proc runFrontend*() =
               if connection != nil and connection.client.name != playerDraft:
                 connection.client.name = playerDraft
                 connection.reconnectAfter(0)
-                lobby.proofRevision = 0
         else:
           case page
           of HomeMenu:
@@ -440,7 +409,7 @@ proc runFrontend*() =
               let config = defaultConfig()
               connection.client.send(RoomMessage(
                 kind: CreateRoom, name: browser.roomName, flag: browser.public,
-                number: uint32(config.teamSize * 2), tickRate: uint32(NetworkTickRate),
+                number: uint32(MaxPudgeCount), tickRate: uint32(NetworkTickRate),
                 payload: config.encodeConfig()
               ))
               error = ""
@@ -472,13 +441,12 @@ proc runFrontend*() =
               shownSeats = if online: snapshot.seats
                 else: local.seats(if needsName: "Player" else: preferences.name)
               editable = not online or
-                (client.welcomed and snapshot.phase == rooms.Lobby and
-                  not lobby.leaving and not lobby.applying)
+                (client.welcomed and not client.began and
+                  snapshot.phase == rooms.Lobby and not lobby.leaving and
+                  not lobby.applying and lobby.prepared == nil)
               owner = not online or snapshot.participant == client.participant
               modal = ui.selectedSeat >= 0
               layout = sk.beginLobby(window, ui, "BATTLE SETUP")
-            if shownSeats.len != config.teamSize * 2:
-              reject("The room roster does not match its bank size")
             sk.drawPudgeRoster(layout)
             var
               emptyCount, ownCount: int
@@ -487,14 +455,17 @@ proc runFrontend*() =
               for participant in snapshot.participants:
                 if participant.id == client.participant:
                   ready = participant.ready
-            for i, seat in shownSeats:
+            for i in 0 ..< min(shownSeats.len, MaxPudgeCount):
               let
+                seat = shownSeats[i]
+                enabled = config.seatEnabled(i)
                 empty = seat.owner == 0
                 mine = not online or seat.owner == client.participant
-                card = i.displaySeat(config.teamSize)
-                human = if online: seat.name == HumanSeatName
-                  else: card == local.human
-                removableBot = online and owner and not human and not empty
+                human = not empty and seat.kind == HumanSeat
+                removable = online and owner and not empty and
+                  (not human or not enabled)
+              if not enabled and empty:
+                continue
               var
                 name = if empty: "Add player" else: seat.name
                 controller = if empty: "Empty slot"
@@ -511,9 +482,10 @@ proc runFrontend*() =
                     controller = participant.name &
                       (if not participant.connected: " / Reconnecting"
                        elif participant.ready: " / Ready" else: " / Not ready")
-              if sk.seatButton(layout, card, name, controller, human, empty,
-                editable and (mine or empty or removableBot) and not modal):
-                  ui.selectedSeat = card
+              if sk.seatButton(layout, i, name, controller, human, empty,
+                editable and ((enabled and (mine or empty)) or removable) and
+                  not modal):
+                  ui.selectedSeat = i
             if owner:
               let fill = layout.left + vec2(22, layout.panelHeight - 154)
               let width = layout.leftWidth - 44
@@ -530,21 +502,30 @@ proc runFrontend*() =
                     if bot.name != ui.selectedBot:
                       continue
                     for i, seat in shownSeats:
-                      if seat.owner != 0:
+                      if seat.owner != 0 or not config.seatEnabled(i):
                         continue
-                      let card = i.displaySeat(config.teamSize)
                       if online:
-                        lobby.policies[card] = bot
                         client.send(RoomMessage(
-                          kind: ClaimSeat, seat: uint32(i), name: bot.name
+                          kind: ClaimSeat, seat: uint32(i), name: bot.name,
+                          seatKind: BotSeat
                         ))
+                        lobby.policies[i] = bot
                       else:
-                        local.policies[card] = bot
+                        local.policies[i] = bot
             if online:
               sk.drawMatchSettings(window, layout, lobby.draft.config, rng,
                 owner and editable and not modal,
                 addr lobby.draft.name, addr lobby.draft.public)
-              sk.lobbyLabel(snapshot.name,
+              let
+                excluded = lobby.draft.config.excludedSeat(shownSeats)
+                roomInfo =
+                  if owner and excluded >= 0:
+                    "Clear player " & $(excluded + 1) & " or increase the bank size."
+                  elif lobby.prepared != nil: "Starting game..."
+                  elif not config.opposingBanks(shownSeats):
+                    "Place at least one butcher on each bank."
+                  else: snapshot.name
+              sk.lobbyLabel(roomInfo,
                 layout.left + vec2(22, layout.panelHeight - 72),
                 layout.leftWidth - 44, tint = LobbyMuted)
               if sk.lobbyButton("Copy invite", layout.footer + vec2(204, 0),
@@ -558,23 +539,28 @@ proc runFrontend*() =
                   client.send(RoomMessage(kind: ReadyStatus, flag: not ready))
               if owner and lobby.draft != lobby.accepted:
                 if sk.lobbyButton("Apply Settings", layout.primary, 250, "settings",
-                  editable and not modal and lobby.draft.name.roomNameValid):
+                  editable and not modal and excluded < 0 and
+                    lobby.draft.name.roomNameValid):
                     let payload = lobby.draft.config.encodeConfig()
-                    var other = lobby.draft.config
-                    other.teamSize = lobby.accepted.config.teamSize
-                    let resize = other == lobby.accepted.config
                     client.send(RoomMessage(
-                      kind: if resize: ResizeRoom else: ConfigureRoom,
+                      kind: ConfigureRoom,
                       payload: payload, name: lobby.draft.name,
-                      number: uint32(lobby.draft.config.teamSize * 2),
+                      number: uint32(MaxPudgeCount),
                       tickRate: uint32(NetworkTickRate), flag: lobby.draft.public
                     ))
                     lobby.waiting = lobby.draft
                     lobby.applying = true
               elif owner and sk.lobbyButton("Start Game", layout.primary,
                 250, "arrow_right", editable and not modal and
-                shownSeats.opposingBanks(config.teamSize), tint = LobbyGreen):
-                  client.send(RoomMessage(kind: StartMatch))
+                  excluded < 0 and config.opposingBanks(shownSeats), tint = LobbyGreen):
+                  let match = prepareNetworkMatch(client, lobby.policies.sources())
+                  try:
+                    client.send(match.startRequest())
+                    lobby.prepared = match
+                    error = ""
+                  except CatchableError:
+                    match.close()
+                    raise
               let reopen = owner and snapshot.phase in {Ended, Desynced}
               if sk.lobbyButton(if reopen: "Return to lobby" else: "Leave room",
                 layout.footer, 190, "arrow_left",
@@ -589,13 +575,13 @@ proc runFrontend*() =
               for bank in 0 .. 1:
                 for space in local.config.teamSize ..< config.teamSize:
                   local.policies[bank * MaxTeamSize + space] = LocalPolicy()
-              if local.human.lobbySeat(local.config.teamSize) < 0:
+              if not local.config.seatEnabled(local.human):
                 local.human = -1
               if sk.lobbyButton("Back", layout.footer, 190, "arrow_left",
                 not modal) or (not modal and window.buttonPressed[KeyEscape]):
                   page = HomeMenu
               if sk.lobbyButton("Start Game", layout.primary, 250, "arrow_right",
-                not modal and local.seats("Player").opposingBanks(local.config.teamSize),
+                not modal and local.config.opposingBanks(local.seats("Player")),
                 tint = LobbyGreen):
                   launchLocal = true
               sk.lobbyLabel(if local.human < 0: "Spectating bots"
@@ -604,19 +590,20 @@ proc runFrontend*() =
                 layout.leftWidth - 44, tint = LobbyMuted)
 
             if ui.selectedSeat >= 0:
-              let
-                card = ui.selectedSeat
-                index = card.lobbySeat(config.teamSize)
+              let index = ui.selectedSeat
               if not editable or index notin 0 ..< shownSeats.len:
                 ui.selectedSeat = -1
-              elif online and shownSeats[index].owner notin
-                [0'u32, client.participant]:
-                  if owner and shownSeats[index].name != HumanSeatName:
-                    let choice = sk.removeBotDialog(window, shownSeats[index].name)
+              elif online and (not config.seatEnabled(index) or
+                shownSeats[index].owner notin [0'u32, client.participant]):
+                  let seat = shownSeats[index]
+                  if owner and seat.owner != 0 and
+                    (seat.kind == BotSeat or not config.seatEnabled(index)):
+                    let choice = sk.removeSeatDialog(window, seat)
                     if choice.chosen:
                       ui.selectedSeat = -1
                       if choice.clear:
                         client.send(RoomMessage(kind: ReleaseSeat, seat: uint32(index)))
+                        lobby.policies[index] = LocalPolicy()
                   else:
                     ui.selectedSeat = -1
               else:
@@ -629,9 +616,8 @@ proc runFrontend*() =
                     else: bots[choice.bot]
                   if not choice.file or selected.bytes.len > 0:
                     if selected.bytes.len > 0 and
-                      (not selected.name.roomNameValid or
-                        selected.name == HumanSeatName):
-                        reject("Choose a valid bot name other than Human")
+                      not selected.name.roomNameValid:
+                        reject("Choose a valid bot name of up to 96 bytes")
                     if online:
                       lobby.joined = true
                       if choice.human:
@@ -639,15 +625,15 @@ proc runFrontend*() =
                       else:
                         client.send(RoomMessage(
                           kind: if choice.clear: ReleaseSeat else: ClaimSeat,
-                          seat: uint32(index), name: selected.name
+                          seat: uint32(index), name: selected.name, seatKind: BotSeat
                         ))
-                      lobby.policies[card] = selected
+                      lobby.policies[index] = selected
                     else:
                       if choice.human:
-                        local.human = card
-                      elif card == local.human:
+                        local.human = index
+                      elif index == local.human:
                         local.human = -1
-                      local.policies[card] = selected
+                      local.policies[index] = selected
 
           if page in {MultiplayerMenu, SettingsMenu} and
             not pudgeBindingCapture() and not bindingCapture and
@@ -672,11 +658,11 @@ proc runFrontend*() =
       window.onFrame = nil
       try:
         let
-          human = local.human.lobbySeat(local.config.teamSize)
+          human = local.human
           name = if preferences.name.confirmedPlayerName: preferences.name
             else: "Player"
           match = newLocalGame(local.config, local.seats(name), human,
-            local.policies.sources(local.config.teamSize))
+            local.policies.sources())
         installGame(match, match.world.worldIndexOfSeat(human))
         error = ""
         let home = runGraphics()

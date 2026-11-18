@@ -1303,7 +1303,7 @@ proc runGraphics*(network: NetworkMatch = nil,
   var
     preferences = graphicsPreferences()
     chainHands: Table[int32, Vec3]
-    leaveMatch, quitToMenu, leaveRequested: bool
+    leaveMatch, quitToMenu: bool
     lastAppliedAt = -1.0
   when defined(emscripten):
     var notifiedPresentation = false
@@ -2245,6 +2245,14 @@ proc runGraphics*(network: NetworkMatch = nil,
       advanceGame()
     else:
       network.applyPacket(packet)
+      let assignedSeat = network.humanPudgeIndex()
+      if localSeat != assignedSeat:
+        localSeat = assignedSeat
+        spectatePudgeId = 0
+        resetHumanTransients()
+        followSelection = localSeat >= 0
+        if followSelection:
+          actionCam.takeManual()
     emitTickParticles()
     emitCombatFeedback()
     if network == nil and (run.world.tick mod (TickRate * 10) == 0 or
@@ -2310,12 +2318,8 @@ proc runGraphics*(network: NetworkMatch = nil,
       quitToMenu = true
       if network == nil or not network.client.welcomed:
         leaveMatch = true
-      elif matchCanControl() and
-          network.client.snapshot.phase in {rooms.Playing, Waiting}:
-        network.abort("Match ended by a player quitting to the main menu")
       else:
         network.client.send(RoomMessage(kind: LeaveRoom))
-        leaveRequested = true
 
   if not run.replayMode and network == nil:
     startReplayRecording(uint32(transport.durationTicks))
@@ -2415,10 +2419,6 @@ proc runGraphics*(network: NetworkMatch = nil,
         if quitToMenu and not network.client.welcomed:
           leaveMatch = true
           return
-        if quitToMenu and not leaveRequested:
-          if network.client.snapshot.phase in {rooms.Ended, Desynced}:
-            network.client.send(RoomMessage(kind: LeaveRoom))
-            leaveRequested = true
         transport.playing = not network.finished and
           network.client.snapshot.phase == rooms.Playing
         transport.setSpeed(0)
@@ -2448,7 +2448,9 @@ proc runGraphics*(network: NetworkMatch = nil,
           inputProjection * cameraView(),
           mouseOverUi(window, sk.mousePos),
           not transport.inHistory and not matchResultsVisible() and
-            (network == nil or network.client.snapshot.phase == rooms.Playing),
+            (network == nil or (network.client.welcomed and
+              not network.client.catchingUp() and
+              network.client.snapshot.phase == rooms.Playing)),
           cameraTarget,
           followSelection,
           rightClickCommand and not window.buttonDown[bindKey(BindPan)],

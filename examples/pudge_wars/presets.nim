@@ -54,6 +54,25 @@ proc validate*(config: MatchConfig) =
     config.runePeriod < 0:
       reject("Invalid Pudge Wars bot or rune settings")
 
+proc seatEnabled*(config: MatchConfig, seat: int): bool =
+  ## Keeps East's lobby addresses fixed when the configured banks resize.
+  seat in 0 ..< MaxPudgeCount and seat mod MaxTeamSize < config.teamSize
+
+proc validateRoster*(config: MatchConfig, seats: openArray[Seat]) =
+  ## Requires the fixed bank layout and at least one occupied slot per side.
+  config.validate()
+  if seats.len != MaxPudgeCount:
+    reject("Pudge Wars rooms need ten stable bank slots")
+  var occupied: array[Team, bool]
+  for i, seat in seats:
+    if seat.owner == 0:
+      continue
+    if not config.seatEnabled(i):
+      reject("Release occupied seats outside the selected bank size")
+    occupied[Team(i div MaxTeamSize)] = true
+  if not occupied[WestTeam] or not occupied[EastTeam]:
+    reject("Place at least one butcher on each bank")
+
 proc encodeConfig*(config: MatchConfig): string =
   ## Writes only the public match settings into the shared room payload.
   config.validate()

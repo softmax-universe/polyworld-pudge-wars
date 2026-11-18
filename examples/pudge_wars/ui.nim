@@ -2046,12 +2046,16 @@ proc drawShopPanel(sk: Silky, window: Window, layout: GameUiLayout) =
     )
 
 proc matchCanControl*(): bool =
-  ## Only a relay participant who owns a seat can pause or end a live match.
+  ## Allows the room owner and current controllers to pause the match.
   if matchNetwork == nil:
     return true
   let client = matchNetwork.client
+  if not client.welcomed or client.participant == 0:
+    return false
+  if client.participant == client.snapshot.participant:
+    return true
   for seat in client.snapshot.seats:
-    if client.participant != 0 and seat.owner == client.participant:
+    if seat.owner == client.participant:
       return true
 
 proc drawMatchMenu*(sk: Silky, window: Window, transport: Player,
@@ -2138,6 +2142,7 @@ proc drawConnectionNotice(sk: Silky, layout: GameUiLayout) =
       if client.status.len > 0: client.status
       else: "Waiting for players…"
     elif client.snapshot.flag and not matchResultsVisible(): "Match paused"
+    elif client.catchingUp() and not matchResultsVisible(): "Catching up to the match…"
     else: ""
   if detail.len > 0:
     let width = min(layout.size.x, 540'f)

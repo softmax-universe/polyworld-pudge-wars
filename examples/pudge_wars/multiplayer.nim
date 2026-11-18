@@ -6,11 +6,12 @@ import
 export presets, roomclients, rooms
 
 const
-  NetworkProtocol* = 1'u32
+  NetworkProtocol* = 2'u32
   NetworkTickRate* = int(HumanTickRate)
   HumanSeatName* = "Human"
   MaxMatchChatBytes = 480
   MaxBotCommandsPerTurn = 64
+  WarningTicks = 3 * 60 * int32(NetworkTickRate)
   ActionChat = 0'u8
   ActionForIntent: array[IntentKind, uint8] = [
     IntentWalk: ActionWalkTo,
@@ -41,13 +42,21 @@ type
     humanIndex: int
     room: string
     matchId, setupHash: uint32
-    seats: seq[Seat]
+    setupDigest: uint64
+    initial: RoomMessage
+    seats: array[MaxPudgeCount, Seat]
     seatPlayers: array[MaxPudgeCount, int]
+    botSeats: array[MaxPudgeCount, Seat]
+    sources: array[MaxPudgeCount, string]
+    sourceNames: array[MaxPudgeCount, string]
     decision: Game
     decisionTick: int32 = -1
   Submission = object
     action: ReplayAction
     text: string
+  RoutedAction = object
+    action: ReplayAction
+    kind: SeatKind
 
 proc identity*(): GameIdentity =
   ## Shares a room only with the same simulation and adapter versions.
@@ -61,74 +70,86 @@ proc humanSeat*(snapshot: RoomMessage, participant: uint32): int =
   result = -1
   for i, seat in snapshot.seats:
     if participant != 0 and seat.owner == participant and
-      seat.name == HumanSeatName:
+      seat.kind == HumanSeat:
         if result >= 0:
           reject("Each participant may control only one Pudge Wars human")
         result = i
 
 proc claimHuman*(client: RoomClient, index: int) =
   ## Moves the local human without taking another participant's slot.
-  if index notin 0 ..< client.snapshot.seats.len or
+  if client.participant == 0 or index notin 0 ..< client.snapshot.seats.len or
     client.snapshot.seats[index].owner notin [0'u32, client.participant]:
       reject("That seat belongs to another participant")
   let old = client.snapshot.humanSeat(client.participant)
   if old >= 0 and old != index:
     client.send(RoomMessage(kind: ReleaseSeat, seat: uint32(old)))
   client.send(RoomMessage(
-    kind: ClaimSeat, seat: uint32(index), name: HumanSeatName
+    kind: ClaimSeat, seat: uint32(index), seatKind: HumanSeat,
+    name: HumanSeatName
   ))
+
+proc seatAt(seats: openArray[Seat], index: int): Seat =
+  ## Treats a generic live resize removing a stable slot as a vacancy.
+  if index in 0 ..< seats.len:
+    result = seats[index]
+
+proc participantName(snapshot: RoomMessage, id: uint32): string =
+  ## Looks up a name in the immutable match setup.
+  for participant in snapshot.participants:
+    if participant.id == id:
+      return participant.name
+
+proc ownsBot(client: RoomClient, seat: Seat, index: int): bool =
+  ## Loads policy bytes only when the local client owns both views of a seat.
+  client == nil or (seat.owner != 0 and seat.owner == client.participant and
+    seat.kind == BotSeat and client.snapshot.seats.seatAt(index) == seat)
 
 proc buildGame(
     config: MatchConfig,
     seats: openArray[Seat],
     localHuman: int,
     sources: openArray[string],
-    client: RoomClient
+    client: RoomClient,
+    snapshot = RoomMessage()
 ): Game =
   ## Packs occupied slots in bank order and loads policy bytes only locally.
-  config.validate()
-  if seats.len != matchPudgeCount(config.teamSize):
-    reject("Pudge Wars roster does not match its team size")
+  config.validateRoster(seats)
   if localHuman < -1 or localHuman >= seats.len or
     (localHuman >= 0 and seats[localHuman].owner == 0):
       reject("Invalid local Pudge Wars human seat")
   let networked = client != nil
   var
-    occupied: array[Team, int]
     roster: seq[ReplayPudge]
     labels: seq[string]
     humanSlots: seq[int]
-  for entry in livePudgeSetup(false, config.teamSize):
+  for lane in livePudgeSetup(false, config.teamSize):
     let
-      i = int(entry.lobbySeat)
+      i = int(lane.team) * MaxTeamSize + int(lane.slot)
       seat = seats[i]
     if seat.owner == 0:
       continue
     let human =
       if networked:
-        seat.name == HumanSeatName
+        seat.kind == HumanSeat
       else:
         i == localHuman
     var label = seat.name
     if networked:
-      discard client.snapshot.humanSeat(seat.owner)
-      label = ""
-      for participant in client.snapshot.participants:
-        if participant.id == seat.owner:
-          label = if human: participant.name else: seat.name
-          break
-      if label.len == 0:
+      discard snapshot.humanSeat(seat.owner)
+      let ownerName = snapshot.participantName(seat.owner)
+      if ownerName.len == 0 or seat.name.len == 0:
         reject("Occupied Pudge Wars seat is missing its owner or label")
+      if human:
+        label = ownerName
     if human:
       humanSlots.add roster.len
-    elif (not networked or seat.owner == client.participant) and
+    elif client.ownsBot(seat, i) and
       (i >= sources.len or sources[i].len == 0):
         reject("Choose a local policy for Pudge Wars seat " & $(i + 1))
-    inc occupied[Team(entry.team)]
+    var entry = lane
+    entry.lobbySeat = uint8(i)
     roster.add entry
     labels.add label
-  if occupied[WestTeam] == 0 or occupied[EastTeam] == 0:
-    reject("Place at least one butcher on each bank")
   result = newGame(
     generateMap(config.seed, config.teamSize),
     config.maxTicks,
@@ -144,11 +165,11 @@ proc buildGame(
   result.botEvery = config.botEvery
   result.botAimNoise = config.botAimNoise
   result.applySeatLabels(labels)
+  result.heroVms.setLen(result.world.pudges.len)
   try:
     for index, pudge in result.world.pudges:
       let i = int(pudge.lobbySeat)
-      if index notin humanSlots and
-        (not networked or seats[i].owner == client.participant):
+      if index notin humanSlots and client.ownsBot(seats[i], i):
           result.loadBotSource(index, sources[i], nil, nil)
   except CatchableError as error:
     result.closeBotServices()
@@ -171,41 +192,70 @@ proc prepareNetworkMatch*(
 ): NetworkMatch =
   ## Prepares this room revision, including seatless replay followers.
   let
-    snapshot = client.snapshot
+    snapshot = client.setupSnapshot()
     config = parseConfig(snapshot.payload)
     human = snapshot.humanSeat(client.participant)
   if client.identity != identity() or snapshot.room.len == 0 or
     snapshot.tickRate != uint32(NetworkTickRate):
       reject("Pudge Wars room identity or tick rate differs from this client")
-  let game = buildGame(config, snapshot.seats, human, sources, client)
+  let game = buildGame(config, snapshot.seats, human, sources, client, snapshot)
   var setupHash = HashySeed
   setupHash.addHashy(config)
   setupHash.addHashy(contentHash())
   setupHash.addHashy(snapshot.seats)
   setupHash.addHashy(game.seatLabels)
   result = NetworkMatch(
-    client: client, game: game, room: snapshot.room, seats: snapshot.seats,
+    client: client, game: game, room: snapshot.room, initial: snapshot,
     revision: snapshot.revision, humanIndex: game.world.worldIndexOfSeat(human),
-    setupHash: setupHash
+    setupHash: setupHash, setupDigest: snapshot.setupHash()
   )
-  for index in result.seatPlayers.mitems:
-    index = -1
+  for i in 0 ..< MaxPudgeCount:
+    result.seatPlayers[i] = -1
+    result.seats[i] = snapshot.seats[i]
+    let live = client.snapshot.seats.seatAt(i)
+    if i < sources.len and client.ownsBot(live, i):
+      result.sources[i] = sources[i]
+      result.sourceNames[i] = live.name
   for i, pudge in game.world.pudges:
     result.seatPlayers[pudge.lobbySeat] = i
+    if game.heroVms[i] != nil:
+      result.botSeats[i] = result.seats[pudge.lobbySeat]
+
+proc startRequest*(match: NetworkMatch): RoomMessage =
+  ## Starts the exact prepared lobby through the game-independent envelope.
+  let
+    client = match.client
+    snapshot = client.snapshot
+  if client.began or snapshot.phase != Lobby or snapshot.room != match.room or
+    snapshot.participant != client.participant or
+    snapshot.revision != match.revision or
+    snapshot.setupHash() != match.setupDigest:
+      reject("Pudge Wars room changed before the owner could start it")
+  RoomMessage(kind: StartMatch, revision: match.revision, hash: match.setupDigest)
 
 proc humanPudgeIndex*(match: NetworkMatch): int =
   ## Returns the local player's packed roster index, or -1 for a spectator.
-  match.humanIndex
+  if match.humanIndex >= 0:
+    let
+      index = int(match.game.world.pudges[match.humanIndex].lobbySeat)
+      live = match.client.snapshot.seats.seatAt(index)
+    if live.owner == match.client.participant and live.kind == HumanSeat:
+      return match.humanIndex
+  -1
 
 proc networkHash*(match: NetworkMatch): uint64 =
   ## Includes static room settings as well as the evolving replay state.
-  (uint64(match.setupHash) shl 32) xor match.game.stateHash()
+  var routingHash = match.setupHash
+  for pudge in match.game.world.pudges:
+    routingHash.addHashy(match.seats[pudge.lobbySeat])
+  (uint64(routingHash) shl 32) xor match.game.stateHash()
 
 proc reopenedLobby*(match: NetworkMatch): bool =
   ## Lets the renderer yield after the host reopens this room for a rematch.
-  match != nil and match.started and
-    match.client.snapshot.room == match.room and
-    match.client.snapshot.phase == Lobby
+  match != nil and match.started and not match.client.began and
+    (match.client.snapshot.room.len == 0 or
+      (match.client.snapshot.room == match.room and
+        match.client.snapshot.phase == Lobby))
 
 proc close*(match: NetworkMatch) =
   ## Releases private policy resources when a match is discarded.
@@ -275,7 +325,14 @@ proc canSubmit(match: NetworkMatch): bool =
   ## Guards new local commands against stale or completed matches.
   match.started and not match.finished and match.client.welcomed and
     match.client.match == match.matchId and
-    match.client.snapshot.phase in {Playing, Waiting}
+    not match.client.catchingUp and match.client.snapshot.phase == Playing
+
+proc canDrive(match: NetworkMatch, seat: uint32, kind: SeatKind): bool =
+  ## Requires both the applied tick and the current room to route this input.
+  let controller = match.seats[seat]
+  controller.owner != 0 and controller.owner == match.client.participant and
+    controller.kind == kind and
+    match.client.snapshot.seats.seatAt(int(seat)) == controller
 
 proc queueHuman*(match: NetworkMatch, intent: HumanIntent): bool =
   ## Submits a local human intent without changing the authoritative world.
@@ -288,8 +345,9 @@ proc queueHuman*(match: NetworkMatch, intent: HumanIntent): bool =
     second: intent.b
   )
   if action.validAction():
-    let seat = match.game.world.pudges[match.humanIndex].lobbySeat
-    result = match.client.submit(uint32(seat), action.encodeAction())
+    let seat = uint32(match.game.world.pudges[match.humanIndex].lobbySeat)
+    if match.canDrive(seat, HumanSeat):
+      result = match.client.submit(seat, action.encodeAction())
 
 proc queueChat*(match: NetworkMatch, text: string): bool =
   ## Submits an ordinary room-wide chat line from the local human seat.
@@ -299,8 +357,38 @@ proc queueChat*(match: NetworkMatch, text: string): bool =
   var bytes: string
   bytes.put32(uint32(ActionChat))
   bytes.putString(message)
-  let seat = match.game.world.pudges[match.humanIndex].lobbySeat
-  match.client.submit(uint32(seat), bytes)
+  let seat = uint32(match.game.world.pudges[match.humanIndex].lobbySeat)
+  match.canDrive(seat, HumanSeat) and match.client.submit(seat, bytes)
+
+proc closeBot(match: NetworkMatch, index: int) =
+  ## Releases a private VM after its authoritative controller changes.
+  let vm = match.game.heroVms[index]
+  if vm != nil and vm.closeServices != nil:
+    vm.closeServices()
+  match.game.heroVms[index] = nil
+  if match.decision != nil:
+    match.decision.heroVms[index] = nil
+  match.botSeats[index] = Seat()
+
+proc loadAssignedBot(match: NetworkMatch, index: int, seat: uint32) =
+  ## Restores a matching local policy or an exactly named bundled policy.
+  let controller = match.seats[seat]
+  var source: string
+  if match.sourceNames[seat] == controller.name:
+    source = match.sources[seat]
+  if source.len == 0:
+    for (name, bundled) in BotPolicies:
+      if name == controller.name:
+        source = bundled
+        break
+  if source.len == 0:
+    reject("No local BASIC policy for the transferred seat " & controller.name)
+  try:
+    match.game.loadBotSource(index, source, nil, nil)
+  except CatchableError as error:
+    echo "pudge ", match.game.world.pudges[index].id, " BASIC error: ", error.msg
+    reject("Cannot load BASIC policy for " & controller.name)
+  match.botSeats[index] = controller
 
 proc flushSubmissions*(match: NetworkMatch) =
   ## Runs each locally owned bot once at the confirmed live edge.
@@ -308,18 +396,24 @@ proc flushSubmissions*(match: NetworkMatch) =
     game = match.game
     client = match.client
     tick = game.world.tick + 1
-  if not match.canSubmit() or client.snapshot.flag or
-    client.applied < client.serverTick or
-    match.decisionTick == tick:
+  var canceled: RoomMessage
+  while client.takeRejected(canceled):
+    discard
+  if not match.canSubmit() or client.snapshot.flag or match.decisionTick == tick:
       return
   match.decisionTick = tick
   var
     ready: bool
     readySeats: array[MaxPudgeCount, bool]
-  for i, vm in game.heroVms:
-    if vm != nil and not vm.failed and game.world.pudges[i].state != Dying and
+  for i, pudge in game.world.pudges:
+    let seat = uint32(pudge.lobbySeat)
+    if not match.canDrive(seat, BotSeat):
+      continue
+    if game.heroVms[i] == nil:
+      match.loadAssignedBot(i, seat)
+    if not game.heroVms[i].failed and pudge.state != Dying and
       (tick + int32(i)) mod game.botEvery == 0 and
-      not client.hasPendingCommand(uint32(game.world.pudges[i].lobbySeat)):
+      not client.hasPendingCommand(seat):
         readySeats[i] = true
         ready = true
   if not ready:
@@ -327,7 +421,7 @@ proc flushSubmissions*(match: NetworkMatch) =
   if match.decision == nil:
     match.decision = Game(
       world: game.world.clone(), map: game.map, networked: true,
-      heroVms: newSeq[HeroVm](game.heroVms.len), humanSlots: game.humanSlots,
+      heroVms: newSeq[HeroVm](game.heroVms.len),
       botEvery: game.botEvery, botAimNoise: game.botAimNoise,
       botSpeech: game.botSpeech,
       recorder: initReplayRecorder(game.recorder.data.header.setup)
@@ -337,8 +431,12 @@ proc flushSubmissions*(match: NetworkMatch) =
   let decision = match.decision
   decision.world.tick = tick
   decision.recorder.data.actions.setLen(0)
+  decision.humanSlots = game.humanSlots
   for i, vm in game.heroVms:
     decision.heroVms[i] = if readySeats[i]: vm else: nil
+    # The ping planner uses the human list to skip roles without a bot.
+    if match.seats[game.world.pudges[i].lobbySeat].owner == 0:
+      decision.humanSlots.add i
   # BASIC actions retain their immediate results on this scratch world.
   decision.runBotDecisions(includeHumans = false)
   game.botSpeech = decision.botSpeech
@@ -360,8 +458,8 @@ proc flushSubmissions*(match: NetworkMatch) =
     if index < 0:
       reject("Local policy command has no Pudge Wars seat")
     let seat = uint32(game.world.pudges[index].lobbySeat)
-    if match.seats[seat].owner != client.participant:
-      reject("Local policy command belongs to another participant")
+    if not match.canDrive(seat, BotSeat):
+      continue
     if submitted[index] >= MaxBotCommandsPerTurn:
       continue
     if not client.submit(seat, action.encodeAction()):
@@ -373,9 +471,8 @@ proc start*(match: NetworkMatch, event: RoomMessage) =
   let client = match.client
   if match.started or event.kind != BeginMatch or
     event.match == 0 or event.match != client.match or
-    event.revision != match.revision or client.snapshot.room != match.room or
-    client.snapshot.revision != match.revision or
-    event.hash != match.networkHash():
+    event.revision != match.revision or event.room != match.room or
+    event.hash != match.setupDigest or event.setupHash() != event.hash:
       reject("Pudge Wars setup changed or its initial state disagrees")
   match.started = true
   match.matchId = event.match
@@ -394,51 +491,89 @@ proc toIntent(action: ReplayAction, index: int): HumanIntent =
   reject("Pudge Wars action has no human intent")
 
 proc applyPacket*(match: NetworkMatch, packet: RoomMessage) =
-  ## Checks ownership before applying the relay's next immutable tick.
+  ## Uses the relay's stamped commands and the tick's sealed routing roster.
   let
     game = match.game
     client = match.client
   if not match.started or match.finished or packet.kind != TickPacket or
     packet.match != match.matchId or client.match != match.matchId or
     packet.tick != uint32(game.world.tick + 1) or
-    packet.tick != client.applied + 1:
+    packet.tick != client.applied + 1 or packet.seats.len == 0:
       reject("Unexpected Pudge Wars simulation tick")
   var
-    actions: array[MaxPudgeCount, seq[ReplayAction]]
+    actions: array[MaxPudgeCount, seq[RoutedAction]]
     chats: seq[MatchChatLine]
+    controllers: array[MaxPudgeCount, Seat]
+    humanOwners: seq[uint32]
+    humanSlots: seq[int]
+    localHuman = -1
+    controlledTick: bool
+  for index, pudge in game.world.pudges:
+    let
+      seat = int(pudge.lobbySeat)
+      controller = packet.seats.seatAt(seat)
+    controllers[seat] = controller
+    if client.participant != 0 and
+      client.participant in [controller.owner, match.seats[seat].owner]:
+        controlledTick = true
+    if controller.owner == 0 or controller.kind != HumanSeat:
+      continue
+    if controller.owner in humanOwners:
+      reject("Each participant may control only one Pudge Wars human")
+    humanOwners.add controller.owner
+    humanSlots.add index
+    if controller.owner == client.participant:
+      localHuman = index
   for command in packet.commands:
-    if command.participant == 0 or command.seat >= uint32(match.seats.len) or
-      match.seats[command.seat].owner != command.participant:
-        reject("Pudge Wars command participant does not own this seat")
+    if command.participant == 0 or command.sequence == 0:
+      reject("Pudge Wars command lacks authenticated routing")
+    # The relay stamps ownership at acceptance, before possible handoffs.
+    if command.seat >= uint32(MaxPudgeCount):
+      continue
     let index = match.seatPlayers[command.seat]
     if index < 0:
-      reject("Pudge Wars command names an empty seat")
+      # Slots added after initialization enter gameplay in the next match.
+      continue
+    if command.participant == client.participant:
+      controlledTick = true
     let submission = decodeSubmission(command.payload)
     if submission.text.len > 0:
-      if index notin game.humanSlots:
+      if command.seatKind != HumanSeat:
         reject("Pudge Wars chat requires a human seat")
+      let playerName = match.initial.participantName(command.participant)
       chats.add MatchChatLine(
         tick: int32(packet.tick), slot: int32(index),
-        name: game.seatLabels[index], text: submission.text, team: -1
+        name: (if playerName.len > 0: playerName else: "Player " & $command.participant),
+        text: submission.text, team: -1
       )
     else:
       var action = submission.action
       action.tick = packet.tick
       action.pudgeId = game.world.pudges[index].id
-      actions[index].add action
+      actions[index].add RoutedAction(action: action, kind: command.seatKind)
   game.tickWorld(proc() =
     ## Resolves each seat in the normal rotating hero turn order.
     let world = game.world
     for offset in 0 ..< world.pudges.len:
-      let index = (world.heroTurnStart + offset) mod world.pudges.len
-      if index in game.humanSlots:
-        for action in actions[index]:
-          game.queueIntent(action.toIntent(index))
-        game.runHumanIntents(index)
-      else:
-        for action in actions[index]:
-          game.recorder.record(action)
-          world.applyReplayAction(action)
+      let
+        index = (world.heroTurnStart + offset) mod world.pudges.len
+        human = index in humanSlots
+      if human != (index in game.humanSlots):
+        game.recorder.recordTakeOver(packet.tick, world.pudges[index].id,
+          if human: ControllerHuman else: ControllerBot)
+      var sawHumanOrder = false
+      for routed in actions[index]:
+        case routed.kind
+        of HumanSeat:
+          game.queueIntent(routed.action.toIntent(index))
+        of BotSeat:
+          if game.humanIntents.len > 0:
+            sawHumanOrder =
+              game.runHumanIntents(index, autoAcquire = false) or sawHumanOrder
+          game.recorder.record(routed.action)
+          world.applyReplayAction(routed.action)
+      if human or game.humanIntents.len > 0:
+        game.runHumanIntents(index, autoAcquire = human and not sawHumanOrder)
     world.heroTurnStart = (world.heroTurnStart + 1) mod world.pudges.len
   )
   if uint32(game.world.tick) != packet.tick:
@@ -447,6 +582,20 @@ proc applyPacket*(match: NetworkMatch, packet: RoomMessage) =
     reject(game.recordingError)
   for line in chats:
     game.appendChat(line)
+  let warningTick = game.maximumTicks - WarningTicks
+  if warningTick > 0 and game.world.tick == warningTick and
+    not game.world.gameOver:
+      game.appendChat(MatchChatLine(
+        tick: warningTick, slot: -1, name: "Match", text: "3 minutes remain",
+        team: -1
+      ))
+  for index, pudge in game.world.pudges:
+    if match.botSeats[index].owner != 0 and
+      match.botSeats[index] != controllers[pudge.lobbySeat]:
+        match.closeBot(index)
+  match.seats = controllers
+  match.humanIndex = localHuman
+  game.humanSlots = humanSlots
   match.finished = game.world.gameOver or game.world.tick >= game.maximumTicks
   client.appliedTick(packet.tick)
   if packet.tick mod uint32(NetworkTickRate) == 0:
@@ -454,12 +603,12 @@ proc applyPacket*(match: NetworkMatch, packet: RoomMessage) =
       kind: ReportHash, match: match.matchId, tick: packet.tick,
       hash: match.networkHash()
     ))
-  if match.finished:
+  if match.finished and controlledTick:
     client.send(RoomMessage(
       kind: FinishMatch, match: match.matchId, tick: packet.tick,
       hash: match.networkHash()
     ))
-  else:
+  elif not match.finished:
     match.flushSubmissions()
 
 proc advanceNetwork*(match: NetworkMatch): bool =

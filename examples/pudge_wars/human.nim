@@ -1340,7 +1340,7 @@ proc handleHumanInput*(
     aimingAttack = false
 
   if not live:
-    if anyCommandPressed(window, rightClickCommand, panTap):
+    if not networkActive and anyCommandPressed(window, rightClickCommand, panTap):
       setHumanError("SPECTATING THE PAST - RETURN TO LIVE TO PLAY")
     cancelAim()
     rmbBlockedCommand = false

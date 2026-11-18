@@ -1,6 +1,6 @@
 # Pudge Wars over Tailscale
 
-Open the Games Showcase client with this relay selected:
+After the Games Showcase PR is deployed, open its client with this relay selected:
 
 https://softmax-universe.github.io/gameshowcase/games/pudge-wars/play/?server=wss%3A%2F%2Fwork-computer.tail0f4a29.ts.net%2Fpudge%2Fws
 
@@ -22,10 +22,12 @@ without Tailscale Funnel.
 - The agent starts at login and restarts the relay if it exits.
 
 The installed relay uses Polyworld commit
-`7b014a3e8a3bdef4d34fdd8b6debb94786245447`, matching `nimby.lock` and the
-client built from Pudge commit `00ea88b308dc0b8a86d1e9b490cd352007bae9bf`.
-The installed `build.json` also records the binary checksum. The browser's
-`build.json` records the published client build.
+`3cc3a0650008533a1200142bc527a0b9226c7682`, matching `nimby.lock`.
+Its server, room protocol, and relay sources are byte-for-byte identical to
+upstream `a8cd9868`. It routes protocol 5 packets without interpreting Pudge
+rules, configuration, or actions. All game-specific validation is in the client.
+The installed `build.json` records the binary checksum and source revisions;
+the browser's `build.json` records its matching client build.
 
 ## Check the service
 

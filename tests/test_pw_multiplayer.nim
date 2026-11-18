@@ -1,5 +1,5 @@
 import
-  std/strutils,
+  std/[sequtils, strutils],
   polyworld/relays,
   ../examples/pudge_wars/[bots, content, game, human, maps, multiplayer, replays, sim]
 
@@ -40,13 +40,6 @@ proc pumpMatches(
         discard
   relay.pump(links, time)
 
-proc prove(match: NetworkMatch) =
-  ## Confirms the room revision and duration using the game-computed hash.
-  match.client.send(RoomMessage(
-    kind: PreparedDuration, revision: match.revision, hash: match.networkHash(),
-    durationTicks: uint32(match.game.maximumTicks)
-  ))
-
 proc beginMatch(match: NetworkMatch) =
   ## Applies the relay's BeginMatch event exactly once.
   doAssert match.client.events.len == 1
@@ -59,6 +52,11 @@ proc rejected(match: NetworkMatch, packet: RoomMessage): bool =
     match.applyPacket(packet)
   except RoomsError:
     return true
+
+proc sealTick(relay: Relay, time: var float64) =
+  ## Advances the real relay's clock by one human-paced game tick.
+  time += 1.0 / float64(NetworkTickRate)
+  relay.advance(time)
 
 echo "Checking Pudge Wars room settings and sparse offline setup"
 block:
@@ -79,8 +77,8 @@ block:
   var
     seats: array[MaxPudgeCount, Seat]
     sources: array[MaxPudgeCount, string]
-  seats[1] = Seat(owner: 1, name: "Local")
-  seats[9] = Seat(owner: 1, name: "Support")
+  seats[1] = Seat(owner: 1, kind: HumanSeat, name: "Local")
+  seats[9] = Seat(owner: 1, kind: BotSeat, name: "Support")
   sources[9] = BotPolicies[4][1]
   let game = newLocalGame(config, seats, 1, sources)
   doAssert game.humanSlots == @[0]
@@ -114,7 +112,7 @@ let
   east = links[1].client
   watcher = links[2].client
 west.send(RoomMessage(
-  kind: CreateRoom, name: "Pudge Wars", number: 6, flag: true,
+  kind: CreateRoom, name: "Pudge Wars", number: MaxPudgeCount, flag: true,
   tickRate: uint32(NetworkTickRate), payload: config.encodeConfig()
 ))
 relay.pump(links, time)
@@ -122,18 +120,25 @@ let room = relay.rooms[0]
 east.send(RoomMessage(kind: JoinRoom, room: room.id))
 relay.pump(links, time)
 west.claimHuman(0)
-west.send(RoomMessage(kind: ClaimSeat, seat: 2, name: "West bot"))
-east.claimHuman(4)
-east.send(RoomMessage(kind: ClaimSeat, seat: 5, name: "East bot"))
+west.send(RoomMessage(
+  kind: ClaimSeat, seat: 2, seatKind: BotSeat, name: "West bot"
+))
+east.claimHuman(6)
+east.send(RoomMessage(
+  kind: ClaimSeat, seat: 7, seatKind: BotSeat, name: "East bot"
+))
 relay.pump(links, time)
 var
-  westSources: array[6, string]
-  eastSources: array[6, string]
+  westSources: array[MaxPudgeCount, string]
+  eastSources: array[MaxPudgeCount, string]
 westSources[2] = "a = walkTo(34, 70)\na = hookTo(88, 68)"
-eastSources[5] = "a = walkTo(94, 69)\na = hookTo(36, 67)\na = rotToggle()"
-westSources[5] = "INVALID REMOTE PROGRAM"
+eastSources[7] = "a = walkTo(94, 69)\na = hookTo(36, 67)\na = rotToggle()"
+westSources[7] = "INVALID REMOTE PROGRAM"
 eastSources[2] = "INVALID REMOTE PROGRAM"
 matches[0] = prepareNetworkMatch(west, westSources)
+west.send(matches[0].startRequest())
+relay.pump(links, time)
+doAssert room.phase == Playing, "Guest readiness must not gate the host"
 matches[1] = prepareNetworkMatch(east, eastSources)
 let
   westMatch = matches[0]
@@ -144,13 +149,7 @@ doAssert westMatch.humanPudgeIndex == 0 and eastMatch.humanPudgeIndex == 2
 doAssert westMatch.game.humanSlots == @[0, 2]
 doAssert westMatch.game.heroVms[1] != nil and westMatch.game.heroVms[3] == nil
 doAssert eastMatch.game.heroVms[1] == nil and eastMatch.game.heroVms[3] != nil
-west.send(RoomMessage(kind: StartMatch))
-westMatch.prove()
-relay.pump(links, time)
-doAssert room.phase == Lobby
-eastMatch.prove()
-relay.pump(links, time)
-doAssert room.phase == Playing
+doAssert west.events[0].hash == west.events[0].setupHash()
 westMatch.beginMatch()
 eastMatch.beginMatch()
 doAssert westMatch.game.heroVms[1].decisions == 1
@@ -184,12 +183,8 @@ doAssert westMatch.networkHash() == initial
 relay.pump(links, time)
 doAssert room.pending.len >= 7
 var invalid = RoomMessage(kind: TickPacket, match: room.match, tick: 1,
-  commands: room.pending)
-invalid.commands[^1].participant =
-  if invalid.commands[^1].participant == east.participant:
-    west.participant
-  else:
-    east.participant
+  seats: room.seats, commands: room.pending)
+invalid.commands[^1].participant = 0
 doAssert westMatch.rejected(invalid)
 invalid.commands[^1] = room.pending[^1]
 invalid.commands[^1].payload.add '\0'
@@ -197,8 +192,7 @@ doAssert westMatch.rejected(invalid)
 doAssert westMatch.networkHash() == initial
 doAssert west.applied == 0 and westMatch.game.world.tick == 0
 
-time += 1.0 / float64(NetworkTickRate)
-relay.advance(time)
+relay.sealTick(time)
 relay.pump(links, time)
 doAssert westMatch.advanceNetwork()
 doAssert eastMatch.advanceNetwork()
@@ -215,17 +209,16 @@ doAssert westMatch.game.intentResults[0].accepted
 echo "Checking in-flight intent retransmission and catch-up"
 doAssert eastMatch.queueHuman(HumanIntent(slot: 2, kind: IntentRot))
 doAssert room.pending.len == 0, "The second bot decision must still be unsent"
-doAssert east.hasPendingCommand(5)
+doAssert east.hasPendingCommand(7)
 relay.disconnect(links[1].connection)
 links[1].connection = 0
 east.lost()
 for overflow in 0 .. MaxClientCommands:
   doAssert not eastMatch.queueHuman(ping)
 doAssert not eastMatch.queueChat("While disconnected")
-doAssert east.outgoing.len == 0 and east.hasPendingCommand(4)
+doAssert east.outgoing.len == 0 and east.hasPendingCommand(6)
 for step in 1 .. 4:
-  time += 1.0 / float64(NetworkTickRate)
-  relay.advance(time)
+  relay.sealTick(time)
   relay.pumpMatches(links, matches, time)
 doAssert west.applied == 5 and east.applied == 1
 doAssert not westMatch.game.world.pudges[2].rotOn
@@ -233,7 +226,7 @@ doAssert westMatch.game.world.pudges[3].rotOn
 links[1].connection = 4
 east.opened()
 relay.pump(links, time)
-doAssert east.applied == 1 and east.hasPendingCommand(5)
+doAssert east.applied == 1 and east.hasPendingCommand(7)
 # The relay received the retried command but has yet to seal its tick.
 relay.disconnect(links[1].connection)
 east.lost()
@@ -247,13 +240,12 @@ doAssert westMatch.game.recorder.data.actions ==
   eastMatch.game.recorder.data.actions
 var retainedRot = 0
 for command in room.pending:
-  if command.seat == 5:
+  if command.seat == 7:
     var reader = PacketReader(data: command.payload)
     if reader.get32() == uint32(ActionRotToggle):
       inc retainedRot
 doAssert retainedRot == 1, "Reconnect must retain exactly one bot decision"
-time += 1.0 / float64(NetworkTickRate)
-relay.advance(time)
+relay.sealTick(time)
 relay.pumpMatches(links, matches, time)
 doAssert westMatch.game.world.pudges[2].rotOn, "Human input stays queued"
 doAssert not westMatch.game.world.pudges[3].rotOn, "Bot toggles Rot once"
@@ -269,11 +261,72 @@ doAssert not matches[2].queueHuman(route)
 doAssert matches[2].networkHash() == westMatch.networkHash()
 doAssert matches[2].game.chatLog == westMatch.game.chatLog
 
-while west.applied < uint32(config.maxTicks):
-  time += 1.0 / float64(NetworkTickRate)
-  relay.advance(time)
+echo "Checking typed handoffs, vacant controllers and immutable earlier input"
+doAssert westMatch.queueHuman(HumanIntent(slot: 0, kind: IntentRot))
+relay.pump(links, time)
+west.send(RoomMessage(kind: ClaimSeat, seat: 0, participant: east.participant,
+  seatKind: BotSeat, name: "Support"))
+relay.pump(links, time)
+var rotated: string
+rotated.put32(uint32(ActionRotToggle))
+rotated.put32(0)
+rotated.put32(0)
+doAssert east.submit(0, rotated)
+relay.pump(links, time)
+west.send(RoomMessage(kind: ClaimSeat, seat: 0, participant: watcher.participant,
+  seatKind: HumanSeat, name: HumanSeatName))
+relay.pump(links, time)
+relay.sealTick(time)
+relay.pumpMatches(links, matches, time)
+doAssert westMatch.humanPudgeIndex == -1
+doAssert matches[2].humanPudgeIndex == 0
+doAssert not westMatch.game.world.pudges[0].rotOn,
+  "The relay must keep both accepted commands through multiple handoffs"
+doAssert westMatch.networkHash() == matches[2].networkHash()
+
+doAssert matches[2].queueHuman(HumanIntent(slot: 0, kind: IntentRot))
+relay.pump(links, time)
+watcher.send(RoomMessage(kind: LeaveRoom))
+relay.pump(links, time)
+matches[2].close()
+matches[2] = nil
+west.send(RoomMessage(kind: ClaimSeat, seat: 0, participant: east.participant,
+  seatKind: BotSeat, name: "Support"))
+relay.pump(links, time)
+relay.sealTick(time)
+relay.pumpMatches(links, matches, time)
+doAssert westMatch.game.world.pudges[0].rotOn,
+  "A participant's queued command survives their departure"
+doAssert eastMatch.game.heroVms[0] != nil and westMatch.game.heroVms[0] == nil
+doAssert eastMatch.game.humanSlots == @[2]
+east.send(RoomMessage(kind: ReleaseSeat, seat: 0))
+relay.pump(links, time)
+relay.sealTick(time)
+relay.pumpMatches(links, matches, time)
+doAssert eastMatch.game.heroVms[0] == nil
+doAssert westMatch.game.world.pudges.len == 4
+
+watcher.send(RoomMessage(kind: JoinRoom, room: room.id))
+relay.pump(links, time)
+matches[2] = prepareNetworkMatch(watcher, [])
+matches[2].beginMatch()
+relay.pumpMatches(links, matches, time)
+doAssert matches[2].humanPudgeIndex == -1
+doAssert matches[2].networkHash() == westMatch.networkHash()
+doAssert matches[2].game.recorder.data == westMatch.game.recorder.data
+
+while west.applied + 1 < uint32(config.maxTicks):
+  relay.sealTick(time)
   relay.pumpMatches(links, matches, time)
   doAssert room.phase != Desynced
+relay.sealTick(time)
+relay.pump(links, time)
+doAssert matches[2].advanceNetwork() and matches[2].finished
+for bytes in watcher.outgoing:
+  doAssert decode(bytes).kind != FinishMatch
+relay.pump(links, time)
+doAssert room.phase == Playing, "A spectator cannot finish the relay match"
+relay.pumpMatches(links, matches, time)
 relay.advance(time)
 relay.pump(links, time)
 doAssert room.phase == Ended
@@ -296,6 +349,7 @@ for tick in 1 .. config.maxTicks:
   playback.tickWorld(nil)
   doAssert playback.stateHash() == data.hashes[tick - 1]
 doAssert playback.stateHash() == westMatch.game.stateHash()
+doAssert data.actions.anyIt(it.kind == ActionTakeOver)
 west.send(RoomMessage(kind: ReturnLobby))
 relay.pump(links, time)
 doAssert westMatch.reopenedLobby() and matches[2].reopenedLobby()
@@ -303,11 +357,9 @@ doAssert westMatch.reopenedLobby() and matches[2].reopenedLobby()
 echo "Checking a private BASIC runtime failure aborts the shared match"
 westSources[2] = "a = rotToggle()\nagain: goto again"
 matches[0] = prepareNetworkMatch(west, westSources)
-matches[1] = prepareNetworkMatch(east, eastSources)
-for i in 0 .. 1:
-  matches[i].prove()
-west.send(RoomMessage(kind: StartMatch))
+west.send(matches[0].startRequest())
 relay.pump(links, time)
+matches[1] = prepareNetworkMatch(east, eastSources)
 try:
   matches[0].beginMatch()
   doAssert false, "A failed private bot decision must abort"
@@ -316,9 +368,10 @@ except RoomsError as error:
   matches[0].abort(error.msg)
 relay.pump(links, time)
 doAssert room.phase == Desynced and east.error.contains("West bot failed")
-doAssert matches[0].game.heroVms[1].failed
+let failureIndex = matches[0].game.world.worldIndexOfSeat(2)
+doAssert matches[0].game.heroVms[failureIndex].failed
 doAssert matches[0].game.recorder.data.actions.len == 0
-doAssert not matches[0].game.world.pudges[1].rotOn
+doAssert not matches[0].game.world.pudges[failureIndex].rotOn
 for i in 0 .. 1:
   matches[i].close()
 
