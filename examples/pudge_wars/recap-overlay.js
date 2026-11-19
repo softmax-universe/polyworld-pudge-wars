@@ -4,6 +4,8 @@
 // page in an iframe and listens on postMessage.
 (function () {
   var recap = null
+  var lobbyButton = null
+  var lobbyRequested = false
   var live = {
     phase: 'boot',
     tick: 0,
@@ -145,8 +147,15 @@
     return html
   }
 
+  function clearOverlay() {
+    var root = document.getElementById('pwRecap')
+    if (root) root.remove()
+    lobbyButton = null
+    lobbyRequested = false
+  }
+
   function showOverlay(expanded) {
-    if (inSiteFrame()) return
+    if (inSiteFrame() || recap.replay) return
     if (!document.getElementById('pwRecapStyle')) {
       var style = document.createElement('style')
       style.id = 'pwRecapStyle'
@@ -161,11 +170,11 @@
         '.pw-recap-table th{font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:#6b7380}' +
         '.pw-recap-actions{display:flex;gap:10px;justify-content:center;flex-wrap:wrap}' +
         '.pw-recap-actions button{min-height:40px;padding:0 16px;border:1px solid #c8ff3d;background:#c8ff3d;color:#07080b;font-size:12px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;cursor:pointer}' +
-        '.pw-recap-actions button:last-child{background:transparent;color:#c8ff3d}'
+        '.pw-recap-actions button:last-child{background:transparent;color:#c8ff3d}' +
+        '.pw-recap-actions button:disabled{opacity:.55;cursor:default}'
       document.head.appendChild(style)
     }
-    var existing = document.getElementById('pwRecap')
-    if (existing) existing.remove()
+    clearOverlay()
     var onSite = isSiteWithRecap()
     var table = onSite && !expanded
       ? ''
@@ -198,7 +207,16 @@
       ' · ' + (recap.east || 0) + ' East'
     var statsBtn = document.getElementById('pwRecapStats')
     if (statsBtn) statsBtn.onclick = goRecap
-    document.getElementById('pwRecapHome').onclick = goHome
+    var back = document.getElementById('pwRecapHome')
+    if (onSite) {
+      back.onclick = goHome
+    } else {
+      lobbyButton = back
+      back.disabled = true
+      back.onclick = function () {
+        lobbyRequested = true
+      }
+    }
   }
 
   function applyJoinLine(text) {
@@ -222,6 +240,14 @@
     pulses += 1
     if (pulses >= 12) clearInterval(pulseTimer)
   }, 400)
+
+  window.pwClearRecap = clearOverlay
+  window.pwTakeRecapLobbyRequest = function (enabled) {
+    if (lobbyButton) lobbyButton.disabled = !enabled
+    var requested = lobbyRequested
+    lobbyRequested = false
+    return enabled && requested
+  }
 
   window.pwHandleGameLine = function (line) {
     var text = '' + line

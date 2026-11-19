@@ -386,14 +386,25 @@ proc clearKillFeed*() =
     run.clearChat()
   cancelChatTyping()
 
-var recapPublished = false
-var lastStatePhase = ""
-var lastStateWest = -1
-var lastStateEast = -1
-var lastStateTick = -32
+var
+  recapPublished = false
+  browserRecapVisible = false
+  lastStatePhase = ""
+  lastStateWest = -1
+  lastStateEast = -1
+  lastStateTick = -32
+
+proc clearMatchRecap() =
+  ## Dismisses the browser card when its match is no longer at the end.
+  when defined(emscripten):
+    if browserRecapVisible:
+      {.emit: """EM_ASM({ window.pwClearRecap?.(); });""".}
+      browserRecapVisible = false
+  recapPublished = false
 
 proc resetMatchRecap*() =
-  recapPublished = false
+  ## Clears the match results and resets browser state reporting.
+  clearMatchRecap()
   lastStatePhase = ""
   lastStateWest = -1
   lastStateEast = -1
@@ -407,6 +418,25 @@ proc matchResultsVisible*(): bool =
       (client.snapshot.phase == rooms.Ended and client.applied >= client.serverTick)
   run.world.gameOver or
     (not run.replayMode and run.world.tick >= run.maximumTicks)
+
+proc canReturnToLobby(): bool =
+  ## Returns whether the relay has moved the room out of active play.
+  matchNetwork != nil and
+    matchNetwork.client.snapshot.phase in {rooms.Ended, Desynced, Lobby}
+
+proc takeBrowserRecapAction*(): MatchMenuAction =
+  ## Routes the browser card's lobby button through the match menu flow.
+  when defined(emscripten):
+    if browserRecapVisible:
+      let enabled = matchNetwork == nil or canReturnToLobby()
+      var requested: cint
+      {.emit: """
+      `requested` = EM_ASM_INT({
+        return window.pwTakeRecapLobbyRequest?.(Boolean($0)) ? 1 : 0;
+      }, `enabled`);
+      """.}
+      if enabled and requested != 0:
+        result = if matchNetwork == nil: Rematch else: ReturnToLobby
 
 proc matchPhaseName(): string =
   ## Reports the live match phase through the browser host bridge.
@@ -485,6 +515,7 @@ proc matchRecapJson(): string =
   $(%*{
     "winner": if winner == WestTeam: "west" else: "east",
     "headline": headline,
+    "replay": run.replayMode,
     "tick": int(run.world.tick),
     "seconds": int(run.world.tick div TickRate),
     "killGoal": int(run.world.killGoal),
@@ -495,10 +526,19 @@ proc matchRecapJson(): string =
   })
 
 proc publishMatchRecap() =
+  ## Publishes the result once and checks whether the browser rendered it.
   if recapPublished:
     return
   recapPublished = true
   echo "pw-match:", matchRecapJson()
+  when defined(emscripten):
+    var mounted: cint
+    {.emit: """
+    `mounted` = EM_ASM_INT({
+      return document.getElementById('pwRecap') ? 1 : 0;
+    });
+    """.}
+    browserRecapVisible = mounted != 0
 
 proc heroBagCount(): int =
   ## Carried items on the inspected butcher; the hero bar grows by them.
@@ -748,7 +788,7 @@ proc mouseOverUi*(window: Window, mouse: Vec2): bool =
   let
     layout = currentLayout(window)
     chrome = placeChrome(layout)
-  if matchResultsVisible() and
+  if not browserRecapVisible and matchResultsVisible() and
       layout.panel(GameUiRegion.Center, PanelEndScreen).contains(mouse):
     return true
   if spectatorChromeVisible() and spectatorBannerPanel(layout).contains(mouse):
@@ -1132,8 +1172,6 @@ proc drawKillStinger(sk: Silky, layout: GameUiLayout) =
 
 proc drawEndScreen(sk: Silky, layout: GameUiLayout): MatchMenuAction =
   ## Victory or defeat plate with the match stat recap.
-  if run.world.gameOver:
-    publishMatchRecap()
   let
     panel = layout.panel(GameUiRegion.Center, PanelEndScreen)
     winner = run.world.winner
@@ -1216,10 +1254,9 @@ proc drawEndScreen(sk: Silky, layout: GameUiLayout): MatchMenuAction =
   let left = inner.origin + vec2(0, actionY)
   let right = left + vec2((count - 1).float32 * (width + 12), 0)
   if matchNetwork != nil:
-    let client = matchNetwork.client
     if sk.lobbyButton(
         "Return to lobby", left, width, height = 34,
-        enabled = client.snapshot.phase in {rooms.Ended, Desynced, Lobby}):
+        enabled = canReturnToLobby()):
       return ReturnToLobby
   elif sk.lobbyButton("Rematch", left, width, height = 34):
     return Rematch
@@ -2079,8 +2116,7 @@ proc drawMatchMenu*(sk: Silky, window: Window, transport: Player,
     ended = matchResultsVisible()
     active = matchNetwork == nil or
       matchNetwork.client.snapshot.phase in {rooms.Playing, Waiting}
-    canReturn = matchNetwork != nil and
-      matchNetwork.client.snapshot.phase in {rooms.Ended, Desynced, Lobby}
+    canReturn = canReturnToLobby()
   sk.lobbyPanel(panel, size)
   if leaving:
     sk.menuLabel("Leaving match…", origin, 464)
@@ -2882,6 +2918,9 @@ proc drawUi*(
       )
   publishMatchState()
   if matchResultsVisible() and not menuOpen:
-    result = sk.drawEndScreen(layout)
+    if run.world.gameOver:
+      publishMatchRecap()
+    if not browserRecapVisible:
+      result = sk.drawEndScreen(layout)
   else:
-    recapPublished = false
+    clearMatchRecap()

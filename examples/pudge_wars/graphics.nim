@@ -1313,6 +1313,7 @@ proc runGraphics*(network: NetworkMatch = nil,
   resetHumanTransients()
   clearKillFeed()
   resetMatchRecap()
+  defer: resetMatchRecap()
   if network != nil:
     connection.stats.tickRate = int(NetworkTickRate)
     connection.playback = TickPlayback()
@@ -2420,6 +2421,10 @@ proc runGraphics*(network: NetworkMatch = nil,
         transport.playing = not network.finished and
           network.client.snapshot.phase == rooms.Playing
         transport.setSpeed(0)
+      let recapAction = takeBrowserRecapAction()
+      if recapAction != StayInMatch:
+        applyMatchMenu(recapAction)
+        return
       updateCamera(dt)
       let recorded = recordedTicksNow()
       transport.sync(run.world.tick, recorded, run.world.gameOver)
