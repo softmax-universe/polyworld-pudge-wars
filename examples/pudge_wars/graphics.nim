@@ -12,7 +12,7 @@ import
   ],
   pudgewars/bottomhud,
   audio, butcherhook, butcherknife, content, director, fog, game, homes, human,
-  keybinds, maps, multiplayer, pacing, practice, replays, sim, ui
+  keybinds, maps, multiplayer, pacing, practice, sim, ui
 
 when defined(emscripten):
   {.emit: "/*INCLUDESECTION*/\n#include <emscripten.h>".}
@@ -2269,9 +2269,6 @@ proc runGraphics*(network: NetworkMatch = nil,
       checkpointIndex = i
     let checkpoint = replayCheckpoints[checkpointIndex]
     run.world.restore(checkpoint.world)
-    if run.recorder != nil and run.replayPlayer != nil:
-      run.replayPlayer.data = run.recorder.data
-    run.replayPlayer.syncCursor(uint32(run.world.tick))
     run.hashCheck = checkpoint.hashCheck
     run.historyPlayback = true
     previousPositions.clear()
@@ -2280,6 +2277,7 @@ proc runGraphics*(network: NetworkMatch = nil,
     particles.clearParticles()
     resetHumanTransients()
     clearKillFeed()
+    run.restoreReplayCursor()
     floatingTexts.setLen(0)
     blinkResidues.setLen(0)
     previousHp.clear()

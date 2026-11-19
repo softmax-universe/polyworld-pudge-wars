@@ -12,7 +12,7 @@ const
   MaxMatchChatBytes = 480
   MaxBotCommandsPerTurn = 64
   WarningTicks = 3 * 60 * int32(NetworkTickRate)
-  ActionChat = 0'u8
+  ChatCommand = 0'u8
   ActionForIntent: array[IntentKind, uint8] = [
     IntentWalk: ActionWalkTo,
     IntentHook: ActionHookTo,
@@ -54,9 +54,6 @@ type
   Submission = object
     action: ReplayAction
     text: string
-  RoutedAction = object
-    action: ReplayAction
-    kind: SeatKind
 
 proc identity*(): GameIdentity =
   ## Shares a room only with the same simulation and adapter versions.
@@ -305,7 +302,7 @@ proc decodeSubmission(bytes: string): Submission =
   ## Decodes one opaque relay payload and rejects malformed variants.
   var reader = PacketReader(data: bytes)
   let kind = reader.get32()
-  if kind == uint32(ActionChat):
+  if kind == uint32(ChatCommand):
     result.text = reader.getString(MaxMatchChatBytes)
     if not result.text.validChat():
       reject("Invalid Pudge Wars chat")
@@ -355,7 +352,7 @@ proc queueChat*(match: NetworkMatch, text: string): bool =
   if not match.canSubmit() or match.humanIndex < 0 or not message.validChat():
     return false
   var bytes: string
-  bytes.put32(uint32(ActionChat))
+  bytes.put32(uint32(ChatCommand))
   bytes.putString(message)
   let seat = uint32(match.game.world.pudges[match.humanIndex].lobbySeat)
   match.canDrive(seat, HumanSeat) and match.client.submit(seat, bytes)
@@ -481,15 +478,6 @@ proc start*(match: NetworkMatch, event: RoomMessage) =
   ))
   match.flushSubmissions()
 
-proc toIntent(action: ReplayAction, index: int): HumanIntent =
-  ## Restores the local input form from a checked network action.
-  for kind, command in ActionForIntent:
-    if command == action.kind:
-      return HumanIntent(
-        slot: int32(index), kind: kind, a: action.first, b: action.second
-      )
-  reject("Pudge Wars action has no human intent")
-
 proc applyPacket*(match: NetworkMatch, packet: RoomMessage) =
   ## Uses the relay's stamped commands and the tick's sealed routing roster.
   let
@@ -501,8 +489,7 @@ proc applyPacket*(match: NetworkMatch, packet: RoomMessage) =
     packet.tick != client.applied + 1 or packet.seats.len == 0:
       reject("Unexpected Pudge Wars simulation tick")
   var
-    actions: array[MaxPudgeCount, seq[RoutedAction]]
-    chats: seq[MatchChatLine]
+    actions: seq[ReplayAction]
     controllers: array[MaxPudgeCount, Seat]
     humanOwners: seq[uint32]
     humanSlots: seq[int]
@@ -541,51 +528,45 @@ proc applyPacket*(match: NetworkMatch, packet: RoomMessage) =
       if command.seatKind != HumanSeat:
         reject("Pudge Wars chat requires a human seat")
       let playerName = match.initial.participantName(command.participant)
-      chats.add MatchChatLine(
-        tick: int32(packet.tick), slot: int32(index),
-        name: (if playerName.len > 0: playerName else: "Player " & $command.participant),
-        text: submission.text, team: -1
+      actions.add ReplayAction(
+        source: HumanCommand, kind: ActionChat, tick: packet.tick,
+        pudgeId: game.world.pudges[index].id, first: int32(index), second: -1,
+        name: (if playerName.len > 0: playerName
+          else: "Player " & $command.participant), text: submission.text
       )
     else:
       var action = submission.action
       action.tick = packet.tick
       action.pudgeId = game.world.pudges[index].id
-      actions[index].add RoutedAction(action: action, kind: command.seatKind)
+      action.source =
+        if command.seatKind == HumanSeat: HumanCommand else: BotCommand
+      actions.add action
+  # Preserve admission order on tape; dispatch still uses hero-turn phases.
+  for index, pudge in game.world.pudges:
+    let human = index in humanSlots
+    if human != (index in game.humanSlots):
+      game.recorder.recordTakeOver(packet.tick, pudge.id,
+        if human: ControllerHuman else: ControllerBot)
+  for action in actions:
+    game.recorder.record(action)
   game.tickWorld(proc() =
-    ## Resolves each seat in the normal rotating hero turn order.
-    let world = game.world
-    for offset in 0 ..< world.pudges.len:
-      let
-        index = (world.heroTurnStart + offset) mod world.pudges.len
-        human = index in humanSlots
-      if human != (index in game.humanSlots):
-        game.recorder.recordTakeOver(packet.tick, world.pudges[index].id,
-          if human: ControllerHuman else: ControllerBot)
-      var sawHumanOrder = false
-      for routed in actions[index]:
-        case routed.kind
-        of HumanSeat:
-          game.queueIntent(routed.action.toIntent(index))
-        of BotSeat:
-          if game.humanIntents.len > 0:
-            sawHumanOrder =
-              game.runHumanIntents(index, autoAcquire = false) or sawHumanOrder
-          game.recorder.record(routed.action)
-          world.applyReplayAction(routed.action)
-      if human or game.humanIntents.len > 0:
-        game.runHumanIntents(index, autoAcquire = human and not sawHumanOrder)
-    world.heroTurnStart = (world.heroTurnStart + 1) mod world.pudges.len
+    ## Uses the same phase executor as ordered network replay playback.
+    game.applyNetworkActions(actions, humanSlots)
   )
   if uint32(game.world.tick) != packet.tick:
     reject("Pudge Wars failed to execute the authoritative tick")
   if game.recordingError.len > 0:
     reject(game.recordingError)
-  for line in chats:
-    game.appendChat(line)
+  for action in actions:
+    if action.kind == ActionChat:
+      game.appendChat(MatchChatLine(
+        tick: int32(action.tick), slot: action.first, team: action.second,
+        name: action.name, text: action.text
+      ))
   let warningTick = game.maximumTicks - WarningTicks
   if warningTick > 0 and game.world.tick == warningTick and
     not game.world.gameOver:
-      game.appendChat(MatchChatLine(
+      game.recordChat(MatchChatLine(
         tick: warningTick, slot: -1, name: "Match", text: "3 minutes remain",
         team: -1
       ))

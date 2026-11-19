@@ -2,18 +2,9 @@
 
 import
   std/[os, strutils],
-  flatty,
   polyworld/tapes,
   ../examples/pudge_wars/content,
   ../examples/pudge_wars/replays
-
-type
-  LegacyTape[Setup] = object
-    formatVersion, gameVersion: uint16
-    createdUnixMs: int64
-    setup: Setup
-    actions: seq[ReplayAction]
-    hashes: seq[uint64]
 
 proc testSetup(): Setup =
   ## Creates a valid replay setup for the codec and cursor tests.
@@ -38,24 +29,6 @@ proc testSetup(): Setup =
       spawnX: int32(if i < TeamSize: 22 else: 106),
       spawnZ: int32(40 + (i mod TeamSize) * 24)
     )
-
-proc legacyReplay[Setup](
-    setup: Setup, formatVersion: uint16, tape: ReplayData
-): string =
-  ## Writes the historical v1 envelope and its timestamped Flatty tape.
-  result = ReplayMagic
-  result.toFlatty(1'u16)
-  result.toFlatty(38'u16)
-  result.toFlatty(uint16(ReplayGame.len))
-  result.add ReplayGame
-  result.toFlatty(LegacyTape[Setup](
-    formatVersion: formatVersion,
-    gameVersion: 38'u16,
-    createdUnixMs: 1_789_000_000_000'i64,
-    setup: setup,
-    actions: tape.actions,
-    hashes: tape.hashes
-  ))
 
 proc rejectReplay(bytes: string, reason = "") =
   ## Requires a replay-specific error for an invalid encoded tape.
@@ -92,10 +65,10 @@ doAssert encoded.startsWith(ReplayMagic)
 doAssert fileHeader.formatVersion == 2'u16
 doAssert fileHeader.formatVersion == ReplayFileVersion
 doAssert fileHeader.game == ReplayGame
-doAssert fileHeader.gameVersion == 38'u16
+doAssert fileHeader.gameVersion == 39'u16
 doAssert fileHeader.gameVersion == ReplayGameVersion
 doAssert decoded.header.formatVersion == ReplayFormatVersion
-doAssert decoded.header.formatVersion == 6'u16
+doAssert decoded.header.formatVersion == 7'u16
 doAssert decoded.header.gameVersion == ReplayGameVersion
 doAssert decoded.header.setup.mapSeed == 2026
 doAssert decoded.header.setup.killGoal == KillGoal
@@ -382,7 +355,7 @@ block:
   except ReplayError as error:
     doAssert error.msg.contains("first at tick 2")
 
-echo "Testing current and legacy named tapes preserve seat labels"
+echo "Testing named tapes preserve seat labels"
 block:
   var named = testSetup()
   named.seatLabels = @[
@@ -390,40 +363,17 @@ block:
     "pudge-wars-rusher:v14 1", "pudge-wars-rusher:v14 2",
     "pudge-wars-rusher:v14 3"
   ]
-  let
-    namedRecorder = initReplayRecorder(named)
-    namedDecoded = decodeReplay(namedRecorder.data.encodeReplay())
-    legacy = legacyReplay(named, 5'u16, decoded)
-    upgraded = decodeReplay(legacy)
-  for tape in [namedDecoded, upgraded]:
-    doAssert tape.header.formatVersion == ReplayFormatVersion
-    doAssert tape.header.setup == named
-    for i, label in named.seatLabels:
-      doAssert tape.config.players[i].name == label
-  doAssert upgraded.actions == decoded.actions
-  doAssert upgraded.hashes == decoded.hashes
-  doAssert decodeReplay(upgraded.encodeReplay()) == upgraded
+  let namedDecoded = decodeReplay(initReplayRecorder(named).data.encodeReplay())
+  doAssert namedDecoded.header.formatVersion == ReplayFormatVersion
+  doAssert namedDecoded.header.setup == named
+  for i, label in named.seatLabels:
+    doAssert namedDecoded.config.players[i].name == label
 
-echo "Testing a legacy v4 tape still loads without names"
+echo "Testing development-only legacy envelopes are rejected"
 block:
-  let
-    v4setup = SetupV4(
-      mapSeed: setup.mapSeed,
-      mapHash: setup.mapHash,
-      tickRate: setup.tickRate,
-      gridTiles: setup.gridTiles,
-      maximumTicks: setup.maximumTicks,
-      killGoal: setup.killGoal,
-      botEvery: setup.botEvery,
-      botAimNoise: setup.botAimNoise,
-      runePeriod: setup.runePeriod,
-      pudges: setup.pudges
-    )
-    legacy = legacyReplay(v4setup, ReplayFormatVersionV4, decoded)
-    upgraded = decodeReplay(legacy)
-  doAssert upgraded.header.formatVersion == ReplayFormatVersion
-  doAssert upgraded == decoded
-  rejectReplay(legacy[0 ..< legacy.len - 1])
+  var old = encoded
+  old[ReplayMagic.len] = '\x01'
+  rejectReplay(old, "Polyworld replay format version")
 
 echo "Testing incompatible envelopes, payloads, and truncated tapes"
 block:
@@ -431,7 +381,7 @@ block:
     offset = ReplayMagic.len + 6 + ReplayGame.len
     olderGame = char(ReplayGameVersion - 1)
     empty = initReplayData(setup)
-  for bytes in [legacyReplay(setup, 5'u16, decoded), encoded]:
+  for bytes in [encoded]:
     var invalid = bytes
     invalid[ReplayMagic.len] = '\x03'
     rejectReplay(invalid, "Polyworld replay format version")
@@ -452,13 +402,14 @@ block:
     invalid[offset + 2] = olderGame
     rejectReplay(invalid, "payload game version")
 
-  for bytes in [encoded, legacyReplay(setup, 5'u16, decoded),
-      empty.encodeReplay(), legacyReplay(setup, 5'u16, empty)]:
+  for bytes in [encoded, empty.encodeReplay()]:
     for length in 0 ..< bytes.len:
       rejectReplay(bytes[0 ..< length])
 
   var tooLong = setup
   tooLong.maximumTicks = high(uint32)
-  rejectReplay(legacyReplay(tooLong, 5'u16, empty), "setup duration")
+  let tooLongData = initReplayData(tooLong)
+  rejectReplay(encodeReplayFile(ReplayGame, ReplayGameVersion, tooLongData),
+    "setup duration")
 
 echo "test_pw_replays: all checks passed"

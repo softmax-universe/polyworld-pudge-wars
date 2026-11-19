@@ -1,13 +1,7 @@
-## Pudge Wars action-only replay format and playback cursor.
-##
-## Format v2 adds the human seat: stop, ping, and take-over actions, a
-## fine-grained (1/256-tile) hook aim, per-slot controller tags, and the
-## recorded match knobs (kill goal, bot decision cadence, bot aim noise).
-## Format v3 records the river rune spawn period; rune motion and pickups
-## are fully deterministic, so no new actions are needed.
+## Pudge Wars ordered action and chat tape with one playback cursor.
 
 import
-  std/[os, times],
+  std/[os, times, unicode],
   flatty,
   polyworld/tapes,
   content
@@ -17,15 +11,10 @@ when defined(posix):
 
 const
   ReplayGame* = "pudge_wars"
-  LegacyReplayFileVersion = 1'u16
   ReplayFileFixedBytes = 6
-  ReplayFormatVersionV4* = 4'u16
-    ## Format before seat labels: Setup ended at `pudges`.
-  ReplayFormatVersionV5 = 5'u16
-    ## Format with seat labels and the original Polyworld tape layout.
-  ReplayFormatVersion* = 6'u16
-    ## Shared Polyworld tapes include match config and omit creation time.
-  ReplayGameVersion* = 38'u16
+  ReplayFormatVersion* = 7'u16
+    ## Chat and admitted network commands share the ordered action stream.
+  ReplayGameVersion* = 39'u16
     ## Physics the *viewer* runs. Observatory's static wasm must ship at
     ## this same number as the recording image (`pwcoworld`). Load and
     ## live handshake reject any other version; a rebuilt wasm cannot
@@ -33,6 +22,7 @@ const
     ## coworld version in lockstep. Live follow also sends this as
     ## `HelloMsg.simVersion` so host and client agree before the first
     ## tick. `NetProtocolVersion` is the wire framing, not this number.
+    ## v39: ordered chat and network command replay with one cursor.
     ## v38: default walk 20% faster (`MovePerTick` 27_000 → 32_400).
     ## v37: Lightning throws fly and reel at double hook speed. Fire
     ##      trails come from the charged hook only (not walking/blink)
@@ -164,6 +154,10 @@ const
     ## Flip Rot on or off. No aim, no cooldown, no mana.
   ActionPlaceWard* = 18'u8
     ## Drop a hidden sight ward on a nearby land tile.
+  ActionChat* = 19'u8
+    ## Chat shares action order; first is roster slot and second is team.
+  MaxChatBytes* = 480
+  MaxChatNameBytes* = 64
   FineAimScale* = 256'i32
     ## Fine-aim units per tile for `ActionHookToFine`.
   ControllerBot* = 0'u8
@@ -200,6 +194,8 @@ type
       ## the live tiles so a later jitter change still replays.
 
   Setup* = object
+    networked*: bool
+      ## True for admitted commands executed in rotating hero-turn phases.
     mapSeed*: int32
     mapHash*: uint64
     tickRate*: uint16
@@ -218,42 +214,22 @@ type
     seatLabels*: seq[string]
       ## Format v5. One display name per roster seat (policy:vN, lobby
       ## name). Empty means the viewer falls back to P<id>. Length 0 is
-      ## a v4 tape or an unnamed local match.
+      ## an unnamed local match.
 
-  SetupV4* = object
-    ## Format v4 Setup: same fields as Setup without seatLabels.
-    mapSeed*: int32
-    mapHash*: uint64
-    tickRate*: uint16
-    gridTiles*: uint16
-    maximumTicks*: uint32
-    killGoal*: int32
-    botEvery*: int32
-    botAimNoise*: int32
-    runePeriod*: int32
-    pudges*: seq[ReplayPudge]
+  ReplaySource* = enum
+    RecordedAction, HumanCommand, BotCommand
 
   ReplayAction* = object
+    source*: ReplaySource
     tick*: uint32
     pudgeId*: int32
     kind*: uint8
     first*: int32
     second*: int32
-
-  LegacyReplayHeader[Setup] = object
-    formatVersion*: uint16
-    gameVersion*: uint16
-    createdUnixMs*: int64
-    setup*: Setup
-
-  LegacyReplayData[Setup] = object
-    header*: LegacyReplayHeader[Setup]
-    actions*: seq[ReplayAction]
-    hashes*: seq[uint64]
+    name*, text*: string
 
   ReplayHeader* = TapeHeader[Setup]
   ReplayData* = ActionTape[Setup, ReplayAction]
-  ReplayDataV4* = LegacyReplayData[SetupV4]
   ReplayRecorder* = TapeRecorder[Setup, ReplayAction]
   ReplayPlayer* = TapePlayer[Setup, ReplayAction]
 
@@ -262,7 +238,17 @@ proc fail(message: string) {.noreturn.} =
   raise newException(ReplayError, message)
 
 proc validKind(kind: uint8): bool =
-  kind >= ActionWalkTo and kind <= ActionPlaceWard
+  ## Accepts the current typed gameplay and chat entries.
+  kind >= ActionWalkTo and kind <= ActionChat
+
+proc validChatText*(text: string, limit = MaxChatBytes): bool =
+  ## Bounds UTF-8 display text and rejects control characters.
+  if text.len notin 1 .. limit or validateUtf8(text) >= 0:
+    return false
+  for ch in text:
+    if ch < ' ' or ch == '\x7f':
+      return false
+  true
 
 proc initReplayData*(setup: Setup): ReplayData =
   ## Creates an empty replay with a versioned deterministic setup.
@@ -388,7 +374,7 @@ proc recordTakeOver*(
     pudgeId: int32,
     controller: uint8
 ) =
-  ## Records who controls a slot from this tick on. Playback ignores it.
+  ## Records who controls a slot from this tick on, including during playback.
   recorder.record ReplayAction(
     tick: tick,
     pudgeId: pudgeId,
@@ -635,7 +621,30 @@ proc validate*(data: ReplayData) =
       fail("replay action exceeds the configured duration")
     if not validKind(action.kind):
       fail("replay action kind is invalid")
-    var known = false
+    if action.kind == ActionChat:
+      if not action.text.validChatText() or
+        not action.name.validChatText(MaxChatNameBytes) or
+        action.first notin -1 ..< int32(setup.pudges.len) or
+        action.second notin -1 .. 1:
+          fail("replay chat metadata is invalid")
+      let speaker =
+        if action.first < 0: 0'i32
+        else: setup.pudges[int(action.first)].id
+      if action.pudgeId != speaker:
+        fail("replay chat references another speaker")
+    elif action.name.len > 0 or action.text.len > 0:
+      fail("gameplay actions cannot contain chat text")
+    if setup.networked:
+      if action.kind notin {ActionTakeOver, ActionChat} and
+        action.source == RecordedAction:
+          fail("network replay requires admitted commands")
+      if action.kind == ActionChat and
+        action.source != HumanCommand and
+        not (action.source == RecordedAction and action.first == -1):
+          fail("network replay chat requires a human or system command")
+    elif action.source != RecordedAction:
+      fail("offline replay cannot contain network commands")
+    var known = action.kind == ActionChat and action.pudgeId == 0
     for pudge in setup.pudges:
       if pudge.id == action.pudgeId:
         known = true
@@ -656,52 +665,12 @@ proc encodeReplay*(data: ReplayData): string =
     MaxReplayBytes
   )
 
-proc upgradeReplay[LegacySetup](
-    old: LegacyReplayData[LegacySetup]
-): ReplayData =
-  ## Upgrades the original Polyworld tape and fills its shared match config.
-  when LegacySetup is SetupV4:
-    let setup = old.header.setup
-    result = initReplayData(Setup(
-      mapSeed: setup.mapSeed,
-      mapHash: setup.mapHash,
-      tickRate: setup.tickRate,
-      gridTiles: setup.gridTiles,
-      maximumTicks: setup.maximumTicks,
-      killGoal: setup.killGoal,
-      botEvery: setup.botEvery,
-      botAimNoise: setup.botAimNoise,
-      runePeriod: setup.runePeriod,
-      pudges: setup.pudges
-    ))
-  else:
-    result = initReplayData(old.header.setup)
-  result.actions = old.actions
-  result.hashes = old.hashes
-
-proc decodeLegacyReplay(
-    bytes: string, offset: int, formatVersion: uint16
-): ReplayData =
-  ## Converts an outer v1 replay to the current in-memory layout.
-  var cursor = offset
-  case formatVersion
-  of ReplayFormatVersionV4:
-    var old: ReplayDataV4
-    bytes.fromFlatty(cursor, old)
-    result = old.upgradeReplay()
-  of ReplayFormatVersionV5:
-    var old: LegacyReplayData[Setup]
-    bytes.fromFlatty(cursor, old)
-    result = old.upgradeReplay()
-  else:
-    fail("unsupported legacy replay format version " & $formatVersion)
-
 proc decodeReplay*(bytes: string): ReplayData =
-  ## Decodes and validates current and gameplay-compatible legacy tapes.
+  ## Decodes and validates the current ordered command tape.
   if bytes.len > MaxReplayBytes:
     fail("replay exceeds the file size limit")
   let header = bytes.replayFileHeader()
-  if header.formatVersion notin {LegacyReplayFileVersion, ReplayFileVersion}:
+  if header.formatVersion != ReplayFileVersion:
     fail(
       "unsupported Polyworld replay format version " & $header.formatVersion
     )
@@ -722,14 +691,11 @@ proc decodeReplay*(bytes: string): ReplayData =
   if gameVersion != ReplayGameVersion:
     fail("unsupported replay payload game version " & $gameVersion)
   try:
-    if header.formatVersion == LegacyReplayFileVersion:
-      result = decodeLegacyReplay(bytes, offset, formatVersion)
-    else:
-      if formatVersion != ReplayFormatVersion:
-        fail("unsupported replay format version " & $formatVersion)
-      result = decodeReplayFile(
-        ReplayGame, ReplayGameVersion, bytes, ReplayData, MaxReplayBytes
-      )
+    if formatVersion != ReplayFormatVersion:
+      fail("unsupported replay format version " & $formatVersion)
+    result = decodeReplayFile(
+      ReplayGame, ReplayGameVersion, bytes, ReplayData, MaxReplayBytes
+    )
   except FlattyError, IndexDefect:
     fail("invalid replay payload: " & getCurrentExceptionMsg())
   result.validate()

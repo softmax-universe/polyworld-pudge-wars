@@ -154,6 +154,65 @@ block:
   doAssert entry["dir"].getStr == logger.dir.extractFilename
   doAssert entry["players"].len == DuelPudgeCount
 
+echo "Testing ordered chat in live and replay analysis logs"
+block:
+  let base = createTempDir("pw_duel_chat", "")
+  defer: removeDir(base)
+  let live = newDuel(2)
+  live.startRecording(2)
+  let liveLogger = newDuelLogger(live, nextMatchDir(base), @[])
+  live.tickWorld(proc() =
+    ## Keeps chat between the same two physical commands in the tape.
+    let stop = ReplayAction(tick: uint32(live.world.tick),
+      pudgeId: live.world.pudges[0].id, kind: ActionStop)
+    live.recorder.record(stop)
+    live.world.applyReplayAction(stop)
+    live.recordChat(MatchChatLine(tick: live.world.tick, slot: 0,
+      team: int32(WestTeam.ord), name: "Duel player",
+      text: "Hook \"left\" — now!"))
+    let rot = ReplayAction(tick: uint32(live.world.tick),
+      pudgeId: live.world.pudges[0].id, kind: ActionRotToggle)
+    live.recorder.record(rot)
+    live.world.applyReplayAction(rot)
+    live.world.heroTurnStart =
+      (live.world.heroTurnStart + 1) mod live.world.pudges.len
+  )
+  liveLogger.logDuelTick(live)
+  liveLogger.logDuelTick(live) # repeated presentation must not duplicate chat
+  liveLogger.finishDuelLog(live)
+  let data = decodeReplay(encodeReplay(live.recorder.data))
+  let replay = newGame(map, 2, true, data)
+  replay.replayPlayer = initReplayPlayer(data)
+  replay.historyPlayback = true
+  let replayLogger = newDuelLogger(replay, nextMatchDir(base), @[])
+  replay.tickWorld(proc() =
+    doAssert false, "Analysis replay must not execute private bot runtimes"
+  )
+  replayLogger.logDuelTick(replay)
+  replayLogger.logDuelTick(replay)
+  replayLogger.finishDuelLog(replay)
+  replay.hashCheck.requireReplayComplete(uint32(replay.world.tick),
+    data.hashes.len)
+
+  var logged: seq[seq[JsonNode]]
+  for logger in [liveLogger, replayLogger]:
+    var actions: seq[JsonNode]
+    for line in readFile(logger.dir / "events.jsonl").strip().splitLines():
+      let event = parseJson(line)
+      if event["ev"].getStr == "action":
+        actions.add event
+    doAssert actions.len == 3
+    doAssert actions[0]["act"].getStr == "stop"
+    doAssert actions[1]["act"].getStr == "chat"
+    doAssert actions[2]["act"].getStr == "rot"
+    doAssert actions[1]["id"].getInt == int(live.world.pudges[0].id)
+    doAssert actions[1]["slot"].getInt == 0
+    doAssert actions[1]["team"].getInt == WestTeam.ord
+    doAssert actions[1]["name"].getStr == "Duel player"
+    doAssert actions[1]["text"].getStr == "Hook \"left\" — now!"
+    logged.add actions
+  doAssert logged[0] == logged[1], "Live and replay analysis order differs"
+
 echo "Testing log directory rotation"
 block:
   let base = createTempDir("pw_duel_dirs", "")

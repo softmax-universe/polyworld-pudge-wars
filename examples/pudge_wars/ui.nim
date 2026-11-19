@@ -2178,13 +2178,14 @@ proc sendChatDraft() =
   let slot =
     if humanControlActive() and heroIndex() >= 0: int32(heroIndex())
     else: -1
-  run.appendChat(MatchChatLine(
+  if not run.queueChat(MatchChatLine(
     tick: run.world.tick,
     slot: slot,
     name: chatSelfName(),
     text: text,
     team: chatSelfTeam()
-  ))
+  )):
+    setHumanError("CHAT COULD NOT BE SENT")
 
 proc chatInputPanel(panel: GameUiPanel): GameUiPanel =
   GameUiPanel(

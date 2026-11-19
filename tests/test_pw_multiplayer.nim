@@ -239,6 +239,7 @@ doAssert eastMatch.game.humanIntents.len == 0
 doAssert eastMatch.game.world.pings.len == 0
 activeNetwork = nil
 doAssert westMatch.queueChat("Ready")
+doAssert westMatch.queueHuman(route)
 doAssert westMatch.game.chatLog.len == 0
 doAssert westMatch.networkHash() == initial
 relay.pump(links, time)
@@ -252,6 +253,11 @@ invalid.commands[^1].payload.add '\0'
 doAssert westMatch.rejected(invalid)
 doAssert westMatch.networkHash() == initial
 doAssert west.applied == 0 and westMatch.game.world.tick == 0
+let admittedKinds = room.pending.mapIt(block:
+  var reader = PacketReader(data: it.payload)
+  let kind = uint8(reader.get32())
+  if kind == 0: ActionChat else: kind
+)
 
 relay.sealTick(time)
 relay.pump(links, time)
@@ -265,6 +271,15 @@ doAssert westMatch.game.world.pudges[3].hooksThrown == 1
 doAssert westMatch.game.world.pings[0].byId == 5
 doAssert westMatch.game.chatLog == eastMatch.game.chatLog
 doAssert westMatch.game.chatLog[0].text == "Ready"
+let ordered = westMatch.game.recorder.data.actions
+doAssert ordered.mapIt(it.kind) == admittedKinds,
+  "Replay must retain packet order, not grouped hero execution order"
+let chatIndex = ordered.mapIt(it.kind).find(ActionChat)
+doAssert chatIndex > 0 and chatIndex + 1 < ordered.len
+doAssert ordered[chatIndex - 1].kind == ActionWalkTo
+doAssert ordered[chatIndex + 1].kind == ActionWalkTo
+doAssert ordered[chatIndex].source == HumanCommand
+doAssert ordered[chatIndex].name == "West" and ordered[chatIndex].text == "Ready"
 doAssert westMatch.game.intentResults[0].accepted
 
 echo "Checking in-flight intent retransmission and catch-up"
@@ -406,11 +421,25 @@ let
   )
 playback.replayPlayer = initReplayPlayer(data)
 playback.historyPlayback = true
+var firstSnapshot: World
 for tick in 1 .. config.maxTicks:
   playback.tickWorld(nil)
+  if tick == 1:
+    firstSnapshot = playback.world.clone()
   doAssert playback.stateHash() == data.hashes[tick - 1]
 doAssert playback.stateHash() == westMatch.game.stateHash()
+doAssert playback.chatLog == westMatch.game.chatLog
+doAssert data.actions.anyIt(it.kind == ActionChat)
 doAssert data.actions.anyIt(it.kind == ActionTakeOver)
+for seek in 0 ..< 2:
+  playback.world.restore(firstSnapshot)
+  playback.restoreReplayCursor()
+  doAssert playback.chatLog.len == 1 and playback.chatLog[0].text == "Ready"
+  for tick in 2 .. config.maxTicks:
+    playback.tickWorld(nil)
+    doAssert playback.stateHash() == data.hashes[tick - 1]
+  doAssert playback.chatLog == westMatch.game.chatLog,
+    "Seek and replay must not duplicate chat or controller transitions"
 west.send(RoomMessage(kind: ReturnLobby))
 relay.pump(links, time)
 doAssert westMatch.reopenedLobby() and matches[2].reopenedLobby()

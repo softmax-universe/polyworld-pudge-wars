@@ -19,10 +19,10 @@ def check_replay(data):
         raise ValueError("Not a Polyworld replay")
     file_version, game_version, game_length = struct.unpack_from("<HHH", data, len(magic))
     payload = len(magic) + 6 + game_length
-    if file_version != 2 or game_version != 38 or data[len(magic) + 6:payload] != b"pudge_wars":
+    if file_version != 2 or game_version != 39 or data[len(magic) + 6:payload] != b"pudge_wars":
         raise ValueError("Unexpected replay header")
     format_version, payload_game_version = struct.unpack_from("<HH", data, payload)
-    if format_version != 6 or payload_game_version != game_version:
+    if format_version != 7 or payload_game_version != game_version:
         raise ValueError("Unexpected replay payload version")
     return data
 

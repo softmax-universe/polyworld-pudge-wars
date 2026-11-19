@@ -11,10 +11,10 @@
 
 import
   chroma, pixie, silky, vmath,
-  polyworld/[chrome, gameuis]
+  polyworld/[chrome, gameuis, player]
 
 const
-  CompactTransportHeight* = 20.0'f32
+  CompactTransportHeight* = TransportHeight
   BottomHudMinWidth* = 1100.0'f32
     ## Room for the compact hero bar with a full bag and the minimap.
   BottomHudMinGameHeight* = 720.0'f32
