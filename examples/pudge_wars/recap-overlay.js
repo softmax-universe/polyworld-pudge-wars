@@ -160,8 +160,8 @@
       var style = document.createElement('style')
       style.id = 'pwRecapStyle'
       style.textContent =
-        '#pwRecap{position:fixed;inset:0;z-index:20;display:flex;align-items:flex-end;justify-content:center;padding:24px;pointer-events:none}' +
-        '.pw-recap-card{pointer-events:auto;width:min(560px,100%);margin-bottom:28px;padding:18px 20px 16px;background:rgba(7,8,11,.92);border:1px solid #c8ff3d;color:#e1e0cc;font-family:"Avenir Next","Segoe UI",system-ui,sans-serif;text-align:center}' +
+        '#pwRecap{position:fixed;inset:0;z-index:20;display:flex;align-items:center;justify-content:center;padding:24px;pointer-events:none}' +
+        '.pw-recap-card{pointer-events:auto;width:min(560px,100%);padding:18px 20px 16px;background:rgba(7,8,11,.92);border:1px solid #c8ff3d;color:#e1e0cc;font-family:"Avenir Next","Segoe UI",system-ui,sans-serif;text-align:center}' +
         '.pw-recap-kicker{margin:0;font-size:11px;letter-spacing:.18em;text-transform:uppercase;color:#6b7380}' +
         '#pwRecapHead{margin:6px 0 4px;font-size:28px;letter-spacing:.12em;text-transform:uppercase;color:#e1e0cc}' +
         '#pwRecapScore{margin:0 0 14px;font-size:13px;letter-spacing:.08em;color:#b4bac4}' +
