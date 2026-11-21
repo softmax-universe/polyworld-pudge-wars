@@ -13,6 +13,8 @@ import
   replays,
   multiplayer
 
+export cli
+
 when defined(headless):
   import std/[times, monotimes]
   import branch
@@ -23,12 +25,12 @@ var
 
 proc usage() =
   echo "Pudge Wars"
-  echo "  --bot:PATH              Fill butcher slots with that script."
-  echo "  --bot:PATH:N            Fill N slots with that file."
-  echo "  --bot PATH[:N]          The equivalent two-argument form."
-  echo "  --human[:SLOT]          A human drives one slot (0-based;"
-  echo "                          default the first free slot)."
-  echo "                          Repeatable. Bots fill the rest."
+  when defined(headless):
+    echo commonUsageFor(AllCommonFlags - GraphicalFlags - {ServerFlag, RoomFlag})
+  else:
+    echo commonUsageFor(AllCommonFlags - {HeadlessTickRateFlag})
+  echo "  --practice-player N     Add another human practice seat (one-based)."
+  echo "                          Repeatable; bots fill the remaining seats."
   echo "  --team-size N           N vs N, N=1..5 (default 3). Spawns"
   echo "                          2N butchers. --duel is still the"
   echo "                          ladder 1v1 (slot 1 of the 3-lane pads)."
@@ -40,7 +42,6 @@ proc usage() =
   echo "                          .jsonl, summary.json, history.jsonl)"
   echo "                          under DIR. Defaults to duels/ in duel"
   echo "                          mode; also works for NvN and replays."
-  echo "  --replay PATH           Play an action replay instead of bots."
   echo "  --branch PATH           Headless: score decision windows of a"
   echo "                          recorded match by counterfactual rollout"
   echo "                          (see --branch-ticks, --branch-slot)."
@@ -56,11 +57,6 @@ proc usage() =
   echo "                          each window (one teacher row each)."
   echo "  --branch-bot PATH       Script for the other seats after the"
   echo "                          branch (default players/base.bas)."
-  echo "  --record PATH           Record match actions to a replay."
-  echo "  --seconds NUMBER        Duration in seconds (default 1200)."
-  echo "  --minutes NUMBER        Duration in minutes (default 20)."
-  echo "  --ticks NUMBER          Duration in ticks (default 38400)."
-  echo "  --seed NUMBER           Live game map seed."
   echo "  --killGoal NUMBER       First team to NUMBER kills wins" &
     " (default " & $KillGoal & ")."
   echo "  --botEvery NUMBER       Bots decide every NUMBER ticks" &
@@ -104,82 +100,10 @@ proc usage() =
   echo "  --quickcast             Hook casts on key press at the cursor."
   echo "  --autocast              Meat Hook autocast: RMB an enemy throws."
   echo "  --keys PATH             Key bindings file (action = KeyName)."
-  echo "  --mute                  Start with the sound off (M toggles)."
-  echo "  --sound                 Start with the sound on."
-  echo "  --play=false            Start the graphical transport paused."
-  echo "  --speed NUMBER          Graphical start speed: 1, 2, 4, or 16."
-  echo "  --windowSize WxH        Graphical window, such as 1024x576."
-  echo "  --screenshot PATH       Save a native screenshot and exit."
-  echo "  --frames N              Capture after N rendered frames (default 30)."
   echo "  --windowPos X,Y         Place the window at screen point X,Y (top-left)."
-  echo "  --vsync:off             Unlock the frame rate (default on)."
-  echo "  --server URL            Shared multiplayer relay address."
-  echo "  --room CODE             Open multiplayer and join a room."
-  echo "  --name TEXT             Saved multiplayer display name."
   echo "  --label TEXT            Per-seat nameplate for local replay tools."
   echo "Compile with -d:headless for command-line simulation."
   echo "Compile with -d:emscripten for the web backend."
-
-proc takePwDurationFlag(
-    options: var GameOptions,
-    arguments: seq[string],
-    index: var int,
-    argument: string
-): bool =
-  ## `--seconds` / `--minutes` / `--ticks` at this game's 32 Hz tick rate.
-  var
-    name = ""
-    text = ""
-  if argument.startsWith("--seconds="):
-    name = "--seconds"
-    text = argument[10 .. ^1]
-  elif argument.startsWith("--minutes="):
-    name = "--minutes"
-    text = argument[11 .. ^1]
-  elif argument.startsWith("--ticks="):
-    name = "--ticks"
-    text = argument[8 .. ^1]
-  else:
-    case argument
-    of "--seconds", "--minutes", "--ticks":
-      name = argument
-      text = arguments.argumentValue(index, argument)
-    else:
-      return false
-  let count = parsePositiveInt32(text, name)
-  var ticks = int64(count)
-  case name
-  of "--seconds":
-    ticks = int64(count) * int64(TickRate)
-  of "--minutes":
-    ticks = int64(count) * 60'i64 * int64(TickRate)
-  of "--ticks":
-    discard
-  else:
-    return false
-  if ticks > int32.high:
-    fail(name & " is too large")
-  options.maximumTicks = int32(ticks)
-  options.seconds = options.maximumTicks div TickRate
-  true
-
-proc addHumanSlot(options: var GameOptions, text: string) =
-  ## Adds one human seat: an explicit slot index or the first free one.
-  var slot = -1'i32
-  if text.len > 0:
-    slot = parseInt32(text, "--human")
-    if slot < 0 or slot >= MaxPudgeCount:
-      fail("--human slot must be between 0 and " & $(MaxPudgeCount - 1))
-  else:
-    for candidate in 0'i32 ..< int32(MaxPudgeCount):
-      if candidate notin options.humanSlots:
-        slot = candidate
-        break
-    if slot < 0:
-      fail("every slot already has a human")
-  if slot in options.humanSlots:
-    fail("slot " & $slot & " already has a human")
-  options.humanSlots.add slot
 
 proc addPilotSlot(options: var GameOptions, text: string) =
   ## Adds one model-driven seat: an explicit slot or the first free one.
@@ -336,40 +260,29 @@ proc takeBranchFlag(options: var GameOptions, arguments: seq[string],
     false
 
 proc parseGameOptions(): GameOptions =
-  # killGoal and duration start unset (zero) so duel mode can pick its
-  # own defaults after the flags are read.
+  ## Parses common launch options and Pudge's match and practice settings.
+  # Goal and duration stay unset until the match mode chooses its defaults.
   result = GameOptions(
-    seed: 2026,
-    speed: 1,
-    windowWidth: 0,
-    windowHeight: 0,
     botEvery: 1,
-    runeSeconds: -1,
-    mute: false
+    runeSeconds: -1
   )
+  result.seed = 2026
+  result.tickRate = TickRate
   let arguments = commandLineParams()
   var index = 0
   while index < arguments.len:
     let argument = arguments[index]
-    if argument in ["--human", "--bot", "--duel", "--practice", "--pilot",
-      "--record"] or
-      argument.startsWith("--human:") or argument.startsWith("--bot:") or
-      argument.startsWith("--bot=") or argument.startsWith("--pilot:") or
-      argument.startsWith("--hybrid:") or argument.startsWith("--record=") or
-      argument.startsWith("--record:"):
+    if splitFlag(argument).name in ["--practice-player", "--duel",
+      "--practice", "--pilot", "--hybrid"]:
         directPlay = true
-    if result.takePwDurationFlag(arguments, index, argument):
-      discard
-    elif result.takeBranchFlag(arguments, index, argument):
+    if result.takeBranchFlag(arguments, index, argument):
       discard
     elif takeThresholdFlag(arguments, index, argument):
       discard
     elif result.takeCommonFlag(arguments, index, argument):
       discard
-    elif argument == "--human":
-      result.addHumanSlot("")
-    elif argument.startsWith("--human:"):
-      result.addHumanSlot(argument[8 .. ^1])
+    elif splitFlag(argument).name == "--practice-player":
+      result.addPracticePlayer(arguments.flagValue(index, argument))
     elif argument == "--duel":
       result.duel = true
     elif argument == "--team-size":
@@ -406,10 +319,6 @@ proc parseGameOptions(): GameOptions =
       result.quickcast = true
     elif argument == "--autocast":
       result.autocast = true
-    elif argument == "--mute":
-      result.mute = true
-    elif argument in ["--sound", "--unmute"]:
-      result.mute = false
     elif argument == "--keys":
       result.keysPath = arguments.argumentValue(index, "--keys")
     elif argument.startsWith("--keys="):
@@ -444,18 +353,6 @@ proc parseGameOptions(): GameOptions =
       )
     elif argument.startsWith("--difficulty="):
       result.applyDifficulty(argument[13 .. ^1])
-    elif argument == "--server":
-      serverAddress = arguments.argumentValue(index, "--server")
-    elif argument.startsWith("--server="):
-      serverAddress = argument[9 .. ^1]
-    elif argument == "--room":
-      roomCode = arguments.argumentValue(index, "--room")
-    elif argument.startsWith("--room="):
-      roomCode = argument[7 .. ^1]
-    elif argument == "--name":
-      result.playerName = arguments.argumentValue(index, "--name")
-    elif argument.startsWith("--name="):
-      result.playerName = argument[7 .. ^1]
     elif argument == "--label":
       result.seatLabels.add arguments.argumentValue(index, "--label")
     elif argument.startsWith("--label="):
@@ -468,6 +365,11 @@ proc parseGameOptions(): GameOptions =
       else:
         fail("unknown argument: " & argument)
     inc index
+  serverAddress = result.serverUrl
+  roomCode = result.roomCode
+  result.configurePlayerSlot()
+  if result.botGroups.len > 0 or result.playerSlot > 0:
+    directPlay = true
   # Unset goal and duration take the mode's defaults: duels are
   # shorter so the play-analyze-improve loop turns around quickly.
   if result.teamSize == 0:
@@ -485,7 +387,7 @@ proc parseGameOptions(): GameOptions =
   if result.duel:
     for slot in result.humanSlots:
       if slot >= DuelPudgeCount:
-        fail("--duel seats are 0 (west) and 1 (east)")
+        fail("--duel player slots are 1 (west) and 2 (east)")
   if result.botAimNoise < 0:
     fail("--botAimNoise must be zero or positive")
   if result.runeSeconds >= 0 and
@@ -496,7 +398,7 @@ proc parseGameOptions(): GameOptions =
     else: matchPudgeCount(int(result.teamSize))
   for slot in result.humanSlots:
     if slot >= seats:
-      fail("--human slot " & $slot & " is outside this roster of " & $seats)
+      fail("human slot " & $(slot + 1) & " is outside this roster of " & $seats)
   for slot in result.pilotSlots:
     if slot >= seats:
       fail("--pilot slot " & $slot & " is outside this roster of " & $seats)
@@ -518,13 +420,16 @@ proc parseGameOptions(): GameOptions =
     if result.coachEndpoint.len == 0: result.coachEndpoint = "local"
   if hybridPlan.len > 0 and hybridSlots.len != 1:
     fail("--hybrid-plan requires exactly one --hybrid seat")
-  result.validateGameOptions(0, "")
-  if result.recordPath.len > 0 or result.matchLogDir.len > 0:
+  when defined(headless):
+    result.common.rejectUnsupportedFlags(AllCommonFlags - {ServerFlag, RoomFlag})
+  result.validateGameOptions(0, "",
+    localLaunch = directPlay or result.matchLogDir.len > 0)
+  if result.matchLogDir.len > 0:
     directPlay = true
   if result.replayPath.len == 0 and
     (defined(headless) or defined(takeScreenshot) or directPlay):
     if result.duel and result.botGroups.len == 0 and
-        result.humanSlots.len < seats:
+        result.humanSlots.len + result.pilotSlots.len < seats:
       # A bare duel pits the seats without humans against the
       # evolving challenger policy.
       result.botGroups.addBotSpec(
@@ -532,19 +437,14 @@ proc parseGameOptions(): GameOptions =
           $(seats - result.humanSlots.len - result.pilotSlots.len)
       )
     elif result.botGroups.len == 0:
-      # Local --human and spectate: stock autopilot on every seat.
-      # Human seats still take input;
-      # the VM is fallback if they release (T).
-      result.botGroups.addBotSpec(findStockBot() & ":" & $seats)
-    let
-      bots = result.botGroups.botCount
-      humans = result.humanSlots.len
-    if bots != seats and bots + humans != seats:
-      fail(
-        "live games need bots for all " & $seats &
-        " seats or all " & $(seats - humans) &
-        " non-human seats; configured " & $bots
-      )
+      let needed = seats - result.humanSlots.len - result.pilotSlots.len
+      if needed > 0:
+        result.botGroups.addBotSpec(findStockBot() & ":" & $needed)
+    result.validateGameOptions(seats, "live games require bots for every non-human seat")
+  result.resolveGamePaths()
+  if result.verbose:
+    echo "launch: seed ", result.seed, " ticks ", result.maximumTicks,
+      " bots ", result.botGroups.botCount, " humans ", result.humanSlots.len
 
 var options* = parseGameOptions()
 
@@ -696,6 +596,8 @@ proc initializeGame*() =
 proc advanceGame*() {.measure.} =
   hybridTick(run)
   tickWorld(run, proc() = runBotDecisions(run))
+  if options.waitForLlm:
+    run.waitForBotRequests()
   practiceTick(run)
   when not defined(emscripten):
     logDuelTick(matchLog, run)
@@ -758,10 +660,7 @@ proc beginPractice*() =
     let shadow = shadowBegin(run, int(slot), matchDir)
     if shadow.enabled:
       echo "shadow seat ", slot, ": ", shadow.dir
-  if matchDir.len > 0 and (options.recordPath.len == 0 or
-      options.recordPath.startsWith(practiceDataDir()) or
-      (options.practiceDir.len > 0 and
-        options.recordPath.startsWith(options.practiceDir))):
+  if matchDir.len > 0 and options.recordPath.len == 0:
     options.recordPath = matchDir / "replay.pwr"
 
 proc vmStatus*(): tuple[active, decisions: int] =
@@ -875,12 +774,20 @@ when defined(headless):
     # freezes simulated time. Offline interventions remain accelerated.
     let realtime = hybridSlots.len > 0 and hybridPlan.len == 0 and
       coachConfig(options.coachEndpoint, options.coachModel).endpoint.len > 0
-    let clockStart = getMonoTime()
+    let
+      pace =
+        if HeadlessTickRateFlag in options.specifiedFlags:
+          options.headlessTickRate
+        elif realtime:
+          TickRate
+        else:
+          0
+      clockStart = getMonoTime()
     while steps < stepLimit and
         (run.replayMode or not run.world.gameOver) and
         run.recordingError.len == 0:
-      if realtime:
-        let remaining = int64(steps) * 1_000_000_000 div int64(TickRate) -
+      if pace > 0:
+        let remaining = int64(steps) * 1_000_000_000 div int64(pace) -
           (getMonoTime() - clockStart).inNanoseconds
         if remaining > 0: sleep(int((remaining + 999_999) div 1_000_000))
       advanceGame()

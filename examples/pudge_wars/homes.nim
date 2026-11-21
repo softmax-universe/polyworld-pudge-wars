@@ -3,10 +3,10 @@ import polyworld/rooms
 
 const PudgeAppName* {.strdefine.} = "Pudge Wars"
 
-proc confirmedPlayerName*(name: string): bool =
-  ## Requires a real display name before opening a relay connection.
+proc confirmedPlayerName*(name: string, explicit = false): bool =
+  ## Accepts valid names while reserving the unconfirmed default for name entry.
   name.len <= 64 and name.validName and name.validateUtf8 == -1 and
-    strutils.strip(name).toLowerAscii != "player"
+    (explicit or strutils.strip(name).toLowerAscii != "player")
 
 proc opensMultiplayer*(room: string): bool =
   ## Routes invitations to multiplayer while retaining the ordinary home screen.

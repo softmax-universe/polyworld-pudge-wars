@@ -86,7 +86,7 @@ nim c -d:release -o:pw examples/pudge_wars/pw.nim
 ./pw
 ```
 
-Run `./pw --human` to start a local match directly, or see the
+Run `./pw --player` to start a local match directly, or see the
 [browser multiplayer runbook](docs/hosted-browser-client.md) to play online.
 
 Headless (no window; CI and bot pacing):
@@ -99,7 +99,7 @@ nim r examples/pudge_wars/pw.nim --replay /tmp/demo.pwr
 
 ## Practice with a decision model, natively
 
-The desktop app and `./pw --human --practice` run a coach on your seat with
+The desktop app and `./pw --player --practice` run a coach on your seat with
 no browser or server. A plate in the top-left corner shows the next move the
 model recommends, why, the key to use, and the plan for the next few
 exchanges. Low-health, hooked and incoming-hook cues are decided locally and
@@ -142,12 +142,12 @@ fine-aimed hook with a little lead, retreat and heal walk home, regroup
 closes toward a teammate, reposition and scout move along the river lip,
 dodge steps off a flying hook's line, upgrade spends the point. Without a
 model (or a confident answer) the pilot takes the first local cue, so it
-always plays. Pilots combine with `--human`, with each other, and with bots
-on the remaining seats; `--human` alone keeps you as the local seat, pilots
+always plays. Pilots combine with `--player`, with each other, and with bots
+on the remaining seats; `--player` alone keeps you as the local seat, pilots
 alone spectate.
 
 ```bash
-./pw --human --practice --coach local --pilot:1 --pilot:2   # the model as your teammates and coach
+./pw --player --practice --coach local --pilot:1 --pilot:2   # the model as your teammates and coach
 ./pw --pilot:0 --pilot:1 --pilot:2 --coach d1 --seconds 120  # headless: D1 vs the stock bots
 ```
 
@@ -192,7 +192,7 @@ open "tmp/desktop/Pudge Wars.app"
 
 Opening the app shows the home screen. Single Player works from the installed
 bundle. To launch a coached local match directly, pass the practice flags with
-`open "tmp/desktop/Pudge Wars.app" --args --human --practice --coach local`.
+`open "tmp/desktop/Pudge Wars.app" --args --player --practice --coach local`.
 Logs are saved to `~/Library/Logs/Pudge Wars/game.log`.
 
 ## Controls
@@ -207,7 +207,7 @@ For choppy native graphics on a laptop, try a smaller window with dynamic
 shadows disabled. This changes rendering cost separately from the game clock:
 
 ```sh
-SUN_SHADOWS=0 ./pw --human --windowSize 1280x800
+SUN_SHADOWS=0 ./pw --player --windowSize 1280x800
 ```
 
 The default players use the customized red and blue butcher. Preview and

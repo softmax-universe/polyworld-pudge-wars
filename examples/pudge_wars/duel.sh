@@ -39,4 +39,4 @@ if [[ -x "examples/pudge_wars/macos/Pudge Wars.app/Contents/MacOS/Pudge Wars" ]]
   pw_bin="examples/pudge_wars/macos/Pudge Wars.app/Contents/MacOS/Pudge Wars"
 fi
 
-exec "$pw_bin" --duel --human:0 "$@"
+exec "$pw_bin" --duel --player:1 "$@"

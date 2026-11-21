@@ -6,6 +6,8 @@ import
 echo "Pudge Wars player and room names"
 doAssert not confirmedPlayerName("")
 doAssert not confirmedPlayerName("  player  ")
+doAssert confirmedPlayerName("Player", explicit = true)
+doAssert not confirmedPlayerName("Player\nTwo", explicit = true)
 doAssert not confirmedPlayerName("Player\nTwo")
 doAssert not confirmedPlayerName("\xff")
 doAssert confirmedPlayerName("  Pudge  ")

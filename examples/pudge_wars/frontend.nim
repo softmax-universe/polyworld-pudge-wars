@@ -137,7 +137,7 @@ proc runFrontend*() =
   let
     queryName = inviteParameter("name")
     name =
-      if options.playerName.confirmedPlayerName: options.playerName
+      if options.playerName.len > 0: options.playerName
       elif queryName.confirmedPlayerName: queryName
       else: ""
   setPudgeLaunchName(name)
@@ -218,7 +218,8 @@ proc runFrontend*() =
   while not window.closeRequested:
     when not defined(emscripten):
       window.updateWindowSettings()
-    if connectRequested and preferences.name.confirmedPlayerName and
+    if connectRequested and preferences.name.confirmedPlayerName(
+      preferences.name == options.playerName) and
       not editPlayer:
         connectRequested = false
         try:
@@ -331,7 +332,9 @@ proc runFrontend*() =
       beginPudgeFrame()
       updateSounds()
       window.updateCursorConfinement(preferences.edgeScrolling)
-      let needsName = not preferences.name.confirmedPlayerName
+      let needsName = not preferences.name.confirmedPlayerName(
+        preferences.name == options.playerName
+      )
       try:
         if editPlayer or (page == MultiplayerMenu and needsName):
           sk.textStyle = "Default"
@@ -340,7 +343,9 @@ proc runFrontend*() =
           let
             view = window.size.vec2 / sk.uiScale
             at = (view - vec2(620, 260)) * 0.5'f
-            valid = playerDraft.confirmedPlayerName
+            valid = playerDraft.confirmedPlayerName(
+              playerDraft == options.playerName
+            )
           sk.drawRect(vec2(0), view, rgbx(0, 0, 0, 110))
           sk.lobbyPanel(at, vec2(620, 260))
           sk.drawLabel(if needsName: "Enter your player name"
@@ -660,8 +665,12 @@ proc runFrontend*() =
       try:
         let
           human = local.human
-          name = if preferences.name.confirmedPlayerName: preferences.name
-            else: "Player"
+          name =
+            if preferences.name.confirmedPlayerName(
+              preferences.name == options.playerName):
+                preferences.name
+            else:
+              "Player"
           match = newLocalGame(local.config, local.seats(name), human,
             local.policies.sources())
         installGame(match, match.world.worldIndexOfSeat(human))

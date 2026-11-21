@@ -700,12 +700,21 @@ proc decodeReplay*(bytes: string): ReplayData =
     fail("invalid replay payload: " & getCurrentExceptionMsg())
   result.validate()
 
+proc prepareReplayDirectory(path: string) =
+  ## Creates the destination directory before writing a replay file.
+  let directory = path.parentDir
+  if directory.len > 0:
+    createDir(directory)
+
 proc saveReplay*(path: string, data: ReplayData) =
-  ## Writes one complete Pudge Wars replay file.
-  writeFile(path, data.encodeReplay())
+  ## Writes one complete Pudge Wars replay file and its destination directories.
+  let bytes = data.encodeReplay()
+  prepareReplayDirectory(path)
+  writeFile(path, bytes)
 
 proc writeFileSynced(path, contents: string) =
   ## Writes `contents` and fsyncs so a mid-match Stop is durable.
+  prepareReplayDirectory(path)
   let f = open(path, fmWrite)
   try:
     f.write(contents)

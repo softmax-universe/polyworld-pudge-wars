@@ -160,7 +160,7 @@ To watch the live default against the reference policy:
   --bot "/Users/aaln/Downloads/myasnik_v75.bas:3"
 ```
 
-Add `--human:0` to play in the first Base seat. Restart `./pw` to load the
+Add `--player:1` to play in the first Base seat. Restart `./pw` to load the
 new BASIC policy; this policy-only update does not require a native
 rebuild.
 

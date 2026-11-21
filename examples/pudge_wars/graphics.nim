@@ -1190,7 +1190,7 @@ proc graphicsPreferences(): Preferences =
   except MenusError, IOError, OSError:
     Preferences(
       bindings: PudgeControlProfile.defaults,
-      mainVolume: if options.mute or captureActive(): 0 else: 100
+      mainVolume: if options.soundMuted or captureActive(): 0 else: 100
     )
 
 proc initializeGraphics*(visible = true) =
@@ -1198,8 +1198,10 @@ proc initializeGraphics*(visible = true) =
   if window != nil:
     return
   configureCapture(options.capture, "examples/pudge_wars/pw_shot.png")
-  if options.mute or captureActive():
-    configureSoundLaunch(true)
+  configureSoundLaunch(
+    options.soundMuted or captureActive(),
+    options.soundOverride or captureActive()
+  )
   let preferences = graphicsPreferences()
   let atlasPath =
     when defined(emscripten):
@@ -1277,7 +1279,7 @@ proc initializeGraphics*(visible = true) =
       ## Releases confinement when focus leaves the window.
       window.updateCursorConfinement()
   profileBlock "audio":
-    initGameAudio(options.mute or captureActive())
+    initGameAudio(options.soundMuted or captureActive())
     preferences.applyPreferences(
       window, configureDisplay = options.windowWidth <= 0 and not captureActive())
   if options.windowX >= 0 and options.windowY >= 0:
@@ -1342,7 +1344,7 @@ proc runGraphics*(network: NetworkMatch = nil,
   profileBlock "terrain":
     amplitude = 1.15'f32
     treeHeight = 7.2'f32
-    seed = run.map.seed
+    quadterrain.seed = run.map.seed
     clearSceneProps()
     if not terrainReady:
       initArenaTerrain()
