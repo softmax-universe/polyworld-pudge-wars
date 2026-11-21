@@ -109,6 +109,8 @@ proc usage() =
   echo "  --play=false            Start the graphical transport paused."
   echo "  --speed NUMBER          Graphical start speed: 1, 2, 4, or 16."
   echo "  --windowSize WxH        Graphical window, such as 1024x576."
+  echo "  --screenshot PATH       Save a native screenshot and exit."
+  echo "  --frames N              Capture after N rendered frames (default 30)."
   echo "  --windowPos X,Y         Place the window at screen point X,Y (top-left)."
   echo "  --vsync:off             Unlock the frame rate (default on)."
   echo "  --server URL            Shared multiplayer relay address."
@@ -592,8 +594,9 @@ when not defined(emscripten):
     ## Structured per-match analysis log; nil when logging is off.
 
   proc duelLoggingWanted(): bool =
-    ## Local matches log when duel mode or an explicit --duellog asks.
-    not networkActive and (options.duel or options.matchLogDir.len > 0)
+    ## Captures keep only explicitly requested logs, not automatic duel logs.
+    not networkActive and (options.matchLogDir.len > 0 or
+      (options.duel and not options.capture.captureRequested()))
 
   proc duelLogBase(): string =
     if options.matchLogDir.len > 0: options.matchLogDir

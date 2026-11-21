@@ -2,12 +2,16 @@
 ##
 ## Every game understands `--bot`, `--replay`, `--record`, `--seed`,
 ## `--play`, `--speed`, `--windowSize`, `--vsync`, `--seconds`, `--minutes`,
-## and `--ticks`. Duration flags all write `maximumTicks`.
+## `--ticks`, `--screenshot`, and `--frames`. Duration flags all write
+## `maximumTicks`.
 ## Each game runs its own argument loop, farms those flags through
 ## `takeCommonFlag`, and handles the rest itself.
 
 import
-  std/strutils
+  std/strutils,
+  polyworld/screenshots
+
+export screenshots
 
 type
   BotGroup* = object
@@ -18,6 +22,7 @@ type
     botGroups*: seq[BotGroup]
     replayPath*: string
     recordPath*: string
+    capture*: ScreenshotOptions
     seed*: int32
     seconds*: int32
       ## Duration in seconds, kept in sync with `maximumTicks`.
@@ -176,16 +181,6 @@ proc parseWindowPos*(text, name: string): (int32, int32) =
   if result[0] < 0 or result[1] < 0:
     fail(name & " must not be negative")
 
-proc parseWindowSize*(text, name: string): (int32, int32) =
-  ## Parses one `WIDTHxHEIGHT` window size, such as `800x400`.
-  let separator = text.find({'x', 'X'})
-  if separator <= 0 or separator >= text.high:
-    fail(name & " must look like 800x400")
-  (
-    parsePositiveInt32(text[0 ..< separator], name),
-    parsePositiveInt32(text[separator + 1 .. ^1], name)
-  )
-
 const
   SharedTickRate* = 24'i32
     ## Simulation ticks per second used by every Polyworld game.
@@ -273,6 +268,14 @@ proc takeCommonFlag*(
     argument: string
 ): bool =
   ## Handles one shared flag. Returns false when the game should try it.
+  try:
+    if options.capture.takeCaptureFlag(arguments, index, argument):
+      return true
+    if takeWindowSizeFlag(options.windowWidth, options.windowHeight,
+        arguments, index, argument):
+      return true
+  except ScreenshotError as error:
+    fail(error.msg)
   if argument.startsWith("--bot:"):
     options.botGroups.addBotSpec(argument[6 .. ^1])
     return true
@@ -281,14 +284,6 @@ proc takeCommonFlag*(
     return true
   if argument.startsWith("--speed="):
     options.speed = parsePositiveInt32(argument[8 .. ^1], "--speed")
-    return true
-  if argument.startsWith("--windowSize:"):
-    (options.windowWidth, options.windowHeight) =
-      parseWindowSize(argument[13 .. ^1], "--windowSize")
-    return true
-  if argument.startsWith("--windowSize="):
-    (options.windowWidth, options.windowHeight) =
-      parseWindowSize(argument[13 .. ^1], "--windowSize")
     return true
   if argument.startsWith("--windowPos:"):
     (options.windowX, options.windowY) =
@@ -337,13 +332,6 @@ proc takeCommonFlag*(
       "--speed"
     )
     result = true
-  of "--windowSize":
-    (options.windowWidth, options.windowHeight) =
-      parseWindowSize(
-        arguments.argumentValue(index, "--windowSize"),
-        "--windowSize"
-      )
-    result = true
   of "--windowPos":
     (options.windowX, options.windowY) =
       parseWindowPos(
@@ -365,6 +353,10 @@ proc validateGameOptions*(
     liveBotMessage: string
 ) =
   ## Checks replay exclusivity and the live-game bot count.
+  try:
+    options.capture.validateCapture()
+  except ScreenshotError as error:
+    fail(error.msg)
   if options.replayPath.len > 0:
     if options.botGroups.len > 0:
       fail("--replay cannot be used with --bot")

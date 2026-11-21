@@ -132,6 +132,8 @@ type
 var
   window*: Window
   sk*: Silky
+  screenshotTarget: ScreenshotTarget
+  screenshotFrames: int
   scene: CharacterScene
   terrainReady: bool
   pudgeModels: array[Team, CharacterModel]
@@ -1188,14 +1190,15 @@ proc graphicsPreferences(): Preferences =
   except MenusError, IOError, OSError:
     Preferences(
       bindings: PudgeControlProfile.defaults,
-      mainVolume: if options.mute: 0 else: 100
+      mainVolume: if options.mute or captureActive(): 0 else: 100
     )
 
 proc initializeGraphics*(visible = true) =
   ## Creates the application window and atlas shared by menus and matches.
   if window != nil:
     return
-  if options.mute:
+  configureCapture(options.capture, "examples/pudge_wars/pw_shot.png")
+  if options.mute or captureActive():
     configureSoundLaunch(true)
   let preferences = graphicsPreferences()
   let atlasPath =
@@ -1274,18 +1277,36 @@ proc initializeGraphics*(visible = true) =
       ## Releases confinement when focus leaves the window.
       window.updateCursorConfinement()
   profileBlock "audio":
-    initGameAudio(options.mute)
+    initGameAudio(options.mute or captureActive())
     preferences.applyPreferences(
-      window, configureDisplay = options.windowWidth <= 0)
+      window, configureDisplay = options.windowWidth <= 0 and not captureActive())
   if options.windowX >= 0 and options.windowY >= 0:
     window.pos = ivec2(options.windowX, options.windowY)
   window.updateCursorConfinement(preferences.edgeScrolling)
   loadPudgeControls(options.quickcast, options.autocast, options.keysPath)
 
 proc closeGraphics*() =
-  ## Releases audio when the application exits.
+  ## Releases audio and screenshot targets when the application exits.
   releaseCursorConfinement()
   closeGameAudio()
+  if window != nil:
+    window.makeContextCurrent()
+    screenshotTarget.releaseScreenshotTarget()
+
+proc beginPudgeFrame*() =
+  ## Selects the shared offscreen target when capturing a hidden window.
+  discard screenshotTarget.beginScreenshotFrame(window)
+
+proc presentPudgeFrame*(paceHz = 60) =
+  ## Captures the requested rendered frame or presents an interactive frame.
+  when defined(emscripten):
+    window.presentFrame(paceHz)
+  else:
+    if captureFrame(window, screenshotFrames, 24,
+        "examples/pudge_wars/pw_shot.png"):
+      window.closeRequested = true
+    elif not captureActive():
+      window.presentFrame(paceHz)
 
 proc runGraphics*(network: NetworkMatch = nil,
     connection: Connection = nil): bool {.discardable.} =
@@ -2326,7 +2347,6 @@ proc runGraphics*(network: NetworkMatch = nil,
     replayCheckpoints = @[captureCheckpoint()]
 
   when defined(takeScreenshot):
-    var screenshotFrame = 0
     # Captures may sit closer or farther than the play zoom clamp.
     zoomMinDistance = 12.0'f32
     zoomMaxDistance = 220.0'f32
@@ -2370,6 +2390,7 @@ proc runGraphics*(network: NetworkMatch = nil,
     if not run.replayMode:
       saveRecording()
   window.onFrame = proc() =
+    beginPudgeFrame()
     if not chatTyping() and not bindingCapture and not pudgeBindingCapture():
       if window.actionPressed(TraceInput):
         toggleRuntimeTrace()
@@ -2626,6 +2647,7 @@ proc runGraphics*(network: NetworkMatch = nil,
             scene.sunDepthPass = true
             drawButchers()
             scene.sunDepthPass = false
+        beginPudgeFrame()
         glClearColor(0.05, 0.07, 0.10, 1.0)
         glClear(GL_COLOR_BUFFER_BIT or GL_DEPTH_BUFFER_BIT)
         applyPlayViewport()
@@ -2893,15 +2915,8 @@ proc runGraphics*(network: NetworkMatch = nil,
         when defined(takeScreenshot): getEnv("SCREENSHOT_HUD") == "1"
         else: true
       if not captureHud:
-        when defined(takeScreenshot):
-          captureScreenshot(
-            window,
-            screenshotFrame,
-            24,
-            "examples/pudge_wars/pw_shot.png"
-          )
         profileBlock "present":
-          window.presentFrame(framePaceHz)
+          presentPudgeFrame(framePaceHz)
         return
       profileBlock "ui":
         glDisable(GL_DEPTH_TEST)
@@ -3066,15 +3081,8 @@ proc runGraphics*(network: NetworkMatch = nil,
           sk.endUi()
           window.runeInputEnabled = chatTyping() and window.focused
           applyMatchMenu(action)
-      when defined(takeScreenshot):
-        captureScreenshot(
-          window,
-          screenshotFrame,
-          24,
-          "examples/pudge_wars/pw_shot.png"
-        )
       profileBlock "present":
-        window.presentFrame(framePaceHz)
+        presentPudgeFrame(framePaceHz)
         reportReplayFrame(run.world.tick, int32(run.hashCheck.mismatches))
       when defined(emscripten):
         if not notifiedPresentation:

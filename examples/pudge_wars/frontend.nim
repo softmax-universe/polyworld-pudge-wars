@@ -328,6 +328,7 @@ proc runFrontend*() =
           preferences.savePreferences(PudgeAppName)
     window.onFrame = proc() =
       ## Draws one home, room, name, or settings frame.
+      beginPudgeFrame()
       updateSounds()
       window.updateCursorConfinement(preferences.edgeScrolling)
       let needsName = not preferences.name.confirmedPlayerName
@@ -646,7 +647,7 @@ proc runFrontend*() =
         sk.lobbyLabel(error, vec2(24, 0), 1400, tint = LobbyRed)
       sk.textStyle = "Default"
       sk.endUi()
-      window.presentFrame(framePaceHz)
+      presentPudgeFrame(framePaceHz)
       reportReplayFrame(0, 0)
       when defined(emscripten):
         if not reportedFrame:

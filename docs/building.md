@@ -1,12 +1,9 @@
 # Build and run Pudge Wars
 
 Run the commands from the Pudge Wars checkout. `scripts/setup.sh` installs Nim
-2.2.10 and the packages pinned in `nimby.lock`. The validated shared engine is
-`96b9cf750d0365adaea50f5729f59ef6366fefa4`, published on Polyworld's
-`center-lobby-icons` branch. Its relay and room protocol sources
-are unchanged from the generic upstream relay at `a8cd9868`. The additional
-engine changes are client, rendering, and build helpers. For development, optionally point
-`PUDGEWARS_POLYWORLD` at a checkout of that revision before setup and builds.
+2.2.10 and the packages pinned in `nimby.lock`, including the shared Polyworld
+engine. For development, optionally point `PUDGEWARS_POLYWORLD` at a checkout
+of the pinned engine revision before setup and builds.
 Setup then uses that engine and installs the remaining locked packages.
 
 ```sh
@@ -64,6 +61,21 @@ mkdir -p build/run
 test -e build/run/examples || ln -s ../../examples build/run/examples
 (cd build/run && ../pw)
 ```
+
+The native client uses the same screenshot flags as the other Polyworld games:
+
+```sh
+./build/pw --screenshot build/captures/menu.png --frames 30 --windowSize 1280x720
+# When using recovered art and its working directory:
+(cd build/run && ../pw --duel --screenshot ../captures/duel.png --frames 30 --windowSize 1280x720)
+```
+
+Screenshot capture renders a hidden, muted window without frame pacing, saves
+the PNG, and exits. It creates missing output directories. `--frames` counts
+rendered frames and defaults to 30. All three flags accept a space, `=`, or `:`
+between the name and value. Captures do not create automatic duel replays;
+explicit `--record` and `--duellog` requests still apply. These screenshot flags
+require the native graphical client.
 
 For a standalone macOS app, run `examples/pudge_wars/macos/build_app.sh`.
 The signed bundle opens at the home screen and contains the required art and
