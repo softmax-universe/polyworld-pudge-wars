@@ -1,5 +1,5 @@
 ## Economy and vision contracts for the default Base policy.
-import std/[os, unittest], polyworld/cli,
+import std/[os, unittest], pudgewars/cli,
   ../examples/pudge_wars/[bots, content, maps, replays, sim]
 
 const EconomyPolicy {.strdefine.} = ""

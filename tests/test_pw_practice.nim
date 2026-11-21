@@ -1,7 +1,7 @@
 ## Jev practice coach: fog-honest options, exact decision samples, traces.
 import
   std/[json, os, sequtils, strutils, tables],
-  polyworld/[cli, oracles],
+  polyworld/[oracles], pudgewars/[cli],
   ../examples/pudge_wars/bots,
   ../examples/pudge_wars/content,
   ../examples/pudge_wars/maps,

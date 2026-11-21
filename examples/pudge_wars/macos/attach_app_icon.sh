@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 ## Stamp a Finder icon onto the Mach-O at the repo root. By default also
-## copies that binary into Pudge Wars.app — pass --no-app to skip the
-## bundle (host_party launches ./pw, not the .app).
+## copies that binary into Pudge Wars.app. Pass --no-app to stamp only
+## the executable.
 ##
 ##   examples/pudge_wars/macos/attach_app_icon.sh [./pw] [--no-app]
 

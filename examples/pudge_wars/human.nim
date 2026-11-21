@@ -8,11 +8,12 @@
 import
   std/[math, times],
   chroma, vmath, windy,
-  cheats, content, fog, game, keybinds, maps, netclient, netpredict,
+  cheats, content, fog, game, keybinds, maps, multiplayer,
   practice, sim,
   polyworld/[gameuis, pathing, rtscameras, shapes]
 
 const
+  RtsCameraDragPixels* = 6.0'f
   PickPixels = 52.0'f32
     ## Screen-space grab radius for inspect / general butcher picks.
   SmartEnemyHalfWidth = 96.0'f32
@@ -289,6 +290,22 @@ proc humanErrorLine*(): tuple[text: string, alpha: float32] =
   let fade = clamp(1.0 - age / ErrorSeconds, 0.0, 1.0)
   (errorText, float32(min(1.0, fade * 3.0)))
 
+proc screenFromClip*(clip: Vec4, panel: GameUiPanel): Vec2 =
+  ## Projects a world point into the arena's top-left pixel rectangle.
+  if clip.w <= 0:
+    return vec2(-10000)
+  vec2(
+    panel.origin.x + (clip.x / clip.w * 0.5'f + 0.5'f) * panel.size.x,
+    panel.origin.y + (0.5'f - clip.y / clip.w * 0.5'f) * panel.size.y
+  )
+
+proc ndcFromScreen*(point: Vec2, panel: GameUiPanel): Vec2 =
+  ## Converts a pointer in the arena viewport into OpenGL coordinates.
+  vec2(
+    (point.x - panel.origin.x) / max(panel.size.x, 1) * 2.0'f - 1.0'f,
+    1.0'f - (point.y - panel.origin.y) / max(panel.size.y, 1) * 2.0'f
+  )
+
 proc renderPoint(position: WorldPoint): Vec3 =
   vec3(
     position.x.float32 / WorldScale.float32,
@@ -301,13 +318,11 @@ proc groundLift(point: Vec3, extra: float32): Vec3 =
   result.y = surfaceHeightNear(point.x, point.z, point.y) + extra
 
 proc heroGroundPoint*(): Vec3 =
-  ## Render-space position of the local hero, for camera centering. On a
-  ## predicting WASM seat this is the predicted position, so the camera
-  ## tracks your own movement with no round-trip lag.
+  ## Returns the confirmed hero position for camera centering.
   let index = heroIndex()
   if index < 0:
     return vec3(0)
-  renderPoint(predictedPudge(index).position)
+  renderPoint(run.world.pudges[index].position)
 
 proc inspectGroundPoint*(): Vec3 =
   ## Render-space position of the butcher shown on the command card.
@@ -578,25 +593,16 @@ proc blinkBlockReason(hero: Pudge): string =
   else:
     ""
 
-proc queueHero(kind: IntentKind, a = 0'i32, b = 0'i32) =
-  ## Routes one command to the authority: the local queue when this
-  ## process owns the sim, the host when following one over the wire.
+proc queueHero(kind: IntentKind, a = 0'i32, b = 0'i32): bool {.discardable.} =
+  ## Queues an offline intent or submits it through the shared relay.
   let index = heroIndex()
   if index < 0:
-    return
+    return false
   let intent = HumanIntent(slot: int32(index), kind: kind, a: a, b: b)
-  if netRole == NetClient:
-    if predictor.enabled:
-      # Apply locally in the prediction world at the predicted tick and
-      # stamp the same tick on the wire, so the host can flag a timing
-      # miss and the follower reconciles this command off the tape.
-      let wanted = uint32(run.world.tick) + uint32(predictor.lead)
-      predictor.record(intent, wanted)
-      netQueueIntent(intent, wanted)
-    else:
-      netQueueIntent(intent)
-  else:
-    queueIntent(run, intent)
+  if networkActive:
+    return activeNetwork != nil and activeNetwork.queueHuman(intent)
+  queueIntent(run, intent)
+  true
 
 proc releaseKeyboardSteer*() =
   ## Stops a live WASD order. Chat, the pause menu, and history seeks
@@ -612,6 +618,8 @@ proc handleCheatCodes(window: Window) =
   ## Accumulates letters the way Warcraft 3 did: type `greedisgood`
   ## anywhere and the purse fills. A pause longer than CheatIdleSeconds
   ## forgets a partial code.
+  if networkActive:
+    return
   let now = epochTime()
   if now - cheatTypedAt > CheatIdleSeconds:
     cheatBuffer.setLen(0)
@@ -677,11 +685,10 @@ proc issueMapPing*(tileX, tileY: int32): bool =
   ## Queues a team ping at one map tile. Same gates as other HUD orders.
   if not canIssueFromHud():
     return false
-  if run.historyPlayback and netRole != NetClient:
+  if run.historyPlayback and not networkActive:
     setHumanError("SPECTATING THE PAST - RETURN TO LIVE TO PLAY")
     return false
   queueHero(IntentPing, tileX, tileY)
-  true
 
 type
   PingMarker* = object
@@ -693,7 +700,7 @@ proc pingMarkers*(): seq[PingMarker] =
   ## Recent pings the local view should draw: own team while seated or
   ## spectating a butcher, every team when omniscient.
   let
-    world = overlayWorld()
+    world = run.world
     viewTeam = viewRelationTeam()
   for ping in world.pings:
     if viewTeam >= 0 and ping.team.ord != viewTeam:
@@ -1176,10 +1183,10 @@ proc handleSeatSwap(
   ## number (1-6). Every handoff is recorded as `ActionTakeOver`.
   if run.replayMode:
     return
-  if netRole == NetClient:
-    # Seats are the host's to hand out; the lobby page swaps them.
+  if networkActive:
+    # Multiplayer seat ownership changes only in the shared lobby.
     if window.buttonPressed[bindKey(BindTakeOver)]:
-      setHumanError("THE HOST LOBBY ASSIGNS SEATS", buzz = false)
+      setHumanError("CHANGE SEATS IN THE LOBBY", buzz = false)
     return
   let swapPressed = window.buttonPressed[bindKey(BindTakeOver)]
   if humanControlActive():
@@ -1333,7 +1340,7 @@ proc handleHumanInput*(
     aimingAttack = false
 
   if not live:
-    if anyCommandPressed(window, rightClickCommand, panTap):
+    if not networkActive and anyCommandPressed(window, rightClickCommand, panTap):
       setHumanError("SPECTATING THE PAST - RETURN TO LIVE TO PLAY")
     cancelAim()
     rmbBlockedCommand = false

@@ -2,7 +2,7 @@
 
 import
   std/[os, strutils],
-  polyworld/[cli, tapes],
+  polyworld/[tapes], pudgewars/[cli],
   ../examples/pudge_wars/bots,
   ../examples/pudge_wars/cheats,
   ../examples/pudge_wars/content,

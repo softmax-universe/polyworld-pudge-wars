@@ -1,14 +1,16 @@
 # Pudge Wars: a live coach and a teammate you can teach
 
-The demo gives the game most of the screen, with a compact right panel for a next-action cue, enemy position estimates, and a short strategy. Only urgent cues appear over the arena. **Coach** hides the panel for more space; **Loom** opens optional teammate teaching tools. You retain all movement and ability controls.
+The September 2026 browser demonstration used the original CoWorld game
+host. The [multiplayer migration](../coworld/GAME_HOSTED_MIGRATION.md) moved
+local evaluation to subprocesses. This checkout retains the strategy,
+reasoning and Realtime integration code for offline evaluation and testing.
+See [symbolic policy evaluation](symbolic/README.md) for the native runner.
 
-Run from the repository root:
+## Original browser demonstration
 
-```sh
-./scripts/coach_demo.sh
-```
-
-Open **http://127.0.0.1:8787** and click **Play 2v2**. The launcher builds matching native/WASM clients. The server automatically reads `TYPESAFE_API_KEY` from the root `.env.local` (gitignored); an existing shell environment takes precedence. `TYPESAFE_MODEL` optionally overrides `jev-latest`. The key stays on the Python server and is stripped from the game host's environment. This Jev experience does not require an OpenAI key.
+The demo gave the game most of the screen, with a right panel for action cues,
+enemy position estimates and strategy. **Coach** hid the panel and **Loom**
+opened teammate teaching tools.
 
 **Now** shows exact visible enemies and Jev's estimated regions for recently seen enemies that have left sight. **In 2 seconds** shows region probabilities for two seconds after the latest model read. Select an enemy to inspect its distribution. Solid markers are sightings; dashed markers are historical sightings; shaded regions are model estimates, not hidden positions. Never-seen enemies have no invented locations. Forecasts expire after two seconds, and the model stops querying enemies after 15 seconds without a sighting. These are uncalibrated model estimates for this game, not measured accuracy or guaranteed hit probabilities.
 
@@ -19,7 +21,7 @@ The worker makes at most one request per second, with one request in flight and 
 This implementation follows TypeSafe's [System One](https://docs.typesafe.ai/concepts/system-one), [Choice](https://docs.typesafe.ai/primitives/choice), and [confidence routing](https://docs.typesafe.ai/patterns/confidence-routing) patterns. Focused behavioral and HTTP integration tests run with:
 
 ```sh
-tmp/coaching/venv/bin/python -m unittest discover -s tests -p 'test_coaching*.py' -v
+uv run --with-requirements coaching/requirements.txt python -m unittest discover -s tests -p 'test_coaching*.py' -v
 ```
 
 ## Teaching Loom
@@ -28,31 +30,11 @@ This local demonstration pairs a human in the existing 3D WASM game with **Loom*
 
 The current representation work is [policies as semantic reasoning in text](policies/README.md): a seven-layer authoring format, an extraction of Loom's existing policy, and a proposed exchange-based policy. Those Markdown artifacts are independent of running the voice demonstration.
 
-## Run
+The September 9 voice check retrieved the model metadata but received
+`credit_balance_exhausted` when creating the Realtime session. The quota
+result is recorded in the [verification report](../docs/coaching-verification-2026-09-09.md).
 
-From the repository root, with the repository's Nim toolchain, Emscripten, Python 3.10+, and sibling `polyworld_data` assets available:
-
-```sh
-./scripts/coach_demo.sh
-```
-
-Open **http://127.0.0.1:8787**, click **Play 2v2**, then **Connect voice**. Focus the arena to use the game's movement and ability controls. You control the human seat; the two opponents use the existing Python rusher policy.
-
-Voice needs `OPENAI_API_KEY` already set in the launching shell's environment. No credential goes into frontend code. The default model is `gpt-realtime-2.1`; `OPENAI_REALTIME_MODEL` can select another compatible Realtime model. Stop and relaunch the server after changing its environment. Without a key, the actual game and typed coaching still run.
-
-For Softmax, use the Secrets Manager setup documented in the sibling `metta` repository:
-
-```sh
-./scripts/coach_demo.sh --softmax-key --port 8788
-```
-
-This reads `openai/agent-api-key` from `us-east-1` using the `softmax` AWS profile and passes it only in the server environment. The value is neither printed nor written to a file. If the AWS login expires, run `aws sso login --profile softmax` first. `COACH_AWS_PROFILE` can select another authorized profile. Put `--softmax-key` before server options.
-
-On September 9, 2026, this credential authenticated and could retrieve `gpt-realtime-2.1` model metadata, but live Realtime creation returned `credit_balance_exhausted`. Restore the key's OpenAI account credits before testing speech. Model visibility alone does not establish available inference quota.
-
-The launcher builds the native authoritative host and matching WASM client, packages the required terrain assets, installs `aiohttp` in `tmp/coaching/venv`, and serves the demo on loopback. Use `--port 8788` if the default port is occupied. `--autopilot` is for headless checks: it replaces the human seat with a policy and should be omitted when playing.
-
-## First demonstration
+## Original demonstration walkthrough
 
 1. Move beside the river. Inspect the playbook: Loom normally hooks the nearest eligible enemy, with low-health retreat and urgent teammate rescues taking priority.
 2. Say **“When I catch someone, follow up before picking your own target.”** The voice model retrieves gameplay context and adds a `follow_up` rule. A typed shortcut, **“follow up on my hooks,”** exercises the same compiler and runtime without a model.
@@ -73,12 +55,12 @@ The **How Loom understands the game** panel holds a working semantic model above
 4. Try a low-confidence catch belief to remove that preference, or revise **Risk of low-health exposure** to explore retreat timing. Confidence is a human assessment, not a learned posterior. The 0.4/0.6 synthesis bands are an explicit demonstration convention.
 5. Say or type **“good job, keep going”** to record encouragement without automatic credit assignment. Use **Give feedback or challenge the framing** to attribute praise/criticism, or preserve a new conceptual distinction and its predicted behavior. Unmapped ontology proposals are visibly marked **needs grounding**.
 
-With funded OpenAI access, Realtime can use `record_reasoning` and `submit_policy_candidate` to propose a complete realization of a revised belief. An external coding agent can submit full policy IR through `/api/reasoning` using the local session token and `operation: submit_policy_candidate`. The generation request supplies the pinned semantic model, policy ancestor, editable scope and synthesis instructions. This path accepts multiple realizations; it does not execute arbitrary generated Python or Nim.
+With funded OpenAI access, Realtime can use `record_reasoning` and `submit_policy_candidate` to propose a complete realization of a revised belief. The original demo accepted full policy IR from external coding agents through its local reasoning endpoint. The generation request supplies the pinned semantic model, policy ancestor, editable scope and synthesis instructions. This path accepts multiple realizations; it does not execute arbitrary generated Python or Nim.
 
 The offline generator is intentionally distinguished from model generation. To run its controlled intervention demonstration:
 
 ```sh
-tmp/coaching/venv/bin/python -m coaching.evaluate_reasoning
+uv run --with-requirements coaching/requirements.txt python -m coaching.evaluate_reasoning
 ```
 
 The report is `tmp/coaching/belief-intervention.json`. Eight reference candidates passed the behavioral contracts in the implementation check. That verifies the pipeline, not the research hypothesis. Working models, source feedback, immutable model snapshots and full generation artifacts are saved under `tmp/coaching/reasoning/<port>/`. Working hypotheses survive restarts; generation requests require fresh match/policy context after restart. **Export model and evidence as JSON** produces an artifact suitable for Git review.
@@ -151,14 +133,14 @@ Speech onset anchors the latest available authoritative observation and selected
 
 ## Evidence and remaining work
 
-Run the focused checks after the launcher has created its environment:
+Run the focused local checks from the repository root.
 
 ```sh
-tmp/coaching/venv/bin/python -m unittest discover -s tests -p 'test_coaching*.py' -v
-nim r --hints:off --warnings:off tests/test_pw_coworld_proto.nim
+uv run --with-requirements coaching/requirements.txt python -m unittest discover -s tests -p 'test_coaching*.py' -v
+nim r --hints:off --warnings:off tests/test_pw_observations.nim
 ```
 
-The 45 Python tests cover policy behavior, scoped edits, semantic history, feedback attribution, multiple realizations, belief interventions, protected behavior, explicit trial activation, stale/asynchronous generation rejection, opponent dependency loading and state isolation, Realtime transport and quota errors. The native protocol suite checks action acceptance and observation semantics. The actual 3D client was tested in local Chromium. The latest live OpenAI test authenticated with the Softmax key but could not proceed to speech because of `credit_balance_exhausted`.
+The Python tests cover policy behavior, scoped edits, semantic history, feedback attribution, multiple realizations, belief interventions, protected behavior, explicit trial activation, stale/asynchronous generation rejection, opponent dependency loading and state isolation, Realtime transport and quota errors. The native observation suite checks action acceptance and observation semantics. The actual 3D client was tested in local Chromium. The latest live OpenAI test authenticated with the Softmax key but could not proceed to speech because of `credit_balance_exhausted`.
 
 The [hands-on verification report](../docs/coaching-verification-2026-09-09.md) records an opponent-loading failure and its fix, 12 browser workflow checks, two live matches and a controlled native intervention. At 40% health, the regenerated policy physically retreated where the original policy continued following its teammate. The ordinary matches did not isolate that intervention, and stronger play remains untested.
 

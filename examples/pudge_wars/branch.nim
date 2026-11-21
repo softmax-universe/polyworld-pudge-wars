@@ -15,7 +15,7 @@
 
 import
   std/[json, os, strutils],
-  polyworld/[cli, rngs],
+  polyworld/[rngs], pudgewars/[cli],
   bots, content, practice, replays, sim
 
 type

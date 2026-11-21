@@ -219,7 +219,7 @@ pointless to play with. The fixes must live **in the sim and on the tape**
 
 | Feature | Notes |
 |---|---|
-| `--human[:slot]` CLI | Fills one slot with the human seat; bots fill the rest (`validateGameOptions` becomes bots + humans == 6; `loadBots` leaves nil VMs, which `runPudgeScript` already skips) |
+| `--player [N]` CLI | Fills one slot with the human seat; bots fill the rest (`validateGameOptions` becomes bots + humans == 6; `loadBots` leaves nil VMs, which `runPudgeScript` already skips) |
 | Intent queue | Client collects integer intents; drained at the hero-turn in slot order through the same record+apply path as bot host procs |
 | Ground picking | Screen ray → terrain height → `tileOf`/`worldAtTile` inverse; entity picking ported from GOTA's screen-space `pickEntity` |
 | RMB move / RMB-on-enemy attack | Smart command |
@@ -324,7 +324,7 @@ New/changed files, respecting the strict dependency order (`content → replays
 | File | Change |
 |---|---|
 | `examples/pudge_wars/human.nim` | New: intents, key bindings, targeting state, HUD-side feedback state |
-| `examples/pudge_wars/game.nim` | `--human` flag, human turn wired into the decision rotation |
+| `examples/pudge_wars/game.nim` | `--player` flag, human turn wired into the decision rotation |
 | `examples/pudge_wars/bots.nim` | `loadBots` tolerates human slots (nil VMs) |
 | `examples/pudge_wars/graphics.nim` | Player camera mode, picking, targeting overlays, ack FX |
 | `examples/pudge_wars/ui.nim` | Hero panel, cooldown radial, error line, kill feed, death/end screens |

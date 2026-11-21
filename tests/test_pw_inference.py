@@ -126,9 +126,10 @@ class InferenceTest(unittest.TestCase):
 
     def mock_jev(self, *, bad=False, delay=0):
         received = []
-        barrier = threading.Barrier(2)
 
         class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
             def log_message(self, *args):
                 pass
 
@@ -136,13 +137,16 @@ class InferenceTest(unittest.TestCase):
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 slot = int(self.headers["X-Coworld-Player-Slot"])
                 received.append((slot, self.path, body, self.headers.get("Authorization")))
-                barrier.wait(timeout=5)
-                time.sleep(delay)
                 response = {} if bad else {"answers": {"mode": {"choice": "push" if slot else "hold"}}}
                 data = json.dumps(response).encode()
                 self.send_response(200)
                 self.send_header("Content-Length", str(len(data)))
+                self.send_header("Connection", "close")
                 self.end_headers()
+                # Curly's PIPEWAIT can delay a same-origin HTTP/1.1 request
+                # until an earlier request finishes. Each reply may finish
+                # independently so the fixture can exercise that scheduling.
+                time.sleep(delay)
                 self.wfile.write(data)
 
         server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -153,7 +157,7 @@ class InferenceTest(unittest.TestCase):
         return {"COWORLD_LLM_ENDPOINT": f"http://127.0.0.1:{server.server_port}",
                 "COGAME_LLM_TIMEOUT_MS": "7000"}, received
 
-    def test_jev_parallel_barrier_slot_accounting_and_private_answers(self):
+    def test_jev_barrier_slot_accounting_and_private_answers(self):
         env, received = self.mock_jev()
         with tempfile.TemporaryDirectory() as temp:
             directory = Path(temp)
@@ -195,8 +199,12 @@ class InferenceTest(unittest.TestCase):
             policy = directory / "timeout.bas"
             policy.write_text(JEV_POLICY)
             output = self.run_episode(directory, [policy, policy], llm=True, env=env)
-            self.assertEqual(len(received), 2)
-            self.assertIn("timed out", (output / "players/0/log.txt").read_text())
+            self.assertTrue(received)
+            for slot in (0, 1):
+                log = (output / f"players/{slot}/log.txt").read_text()
+                self.assertIn("JEV failed LLM request timed out", " ".join(log.split()))
+            results = json.loads((output / "results.json").read_text())
+            self.assertEqual(results["end_tick"], 4)
 
 
 if __name__ == "__main__":

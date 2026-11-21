@@ -1,21 +1,29 @@
---path:"src"
-# Sibling checkouts (nimby workspace next to this repo) and in-repo clones.
---path:"../silky/src"
---path:"silky/src"
---path:"../shady/src"
---path:"shady/src"
---path:"../noisy/src"
---path:"noisy/src"
---path:"../windy/src"
---path:"windy/src"
---path:"../gltf/src"
---path:"gltf/src"
---path:"../vmath/src"
---path:"vmath/src"
+import std/[os, strutils]
 
---define:nimTypeNames
---define:flatty64
+include "src/pudgewars/dependencies.nims"
+
+let projectRoot = thisDir()
+switch("path", projectRoot / "src")
+switch("path", polyworldDirectory(projectRoot) / "src")
+for line in readFile(projectRoot / "nimby.lock").splitLines():
+  let fields = line.splitWhitespace()
+  if fields.len == 0 or fields[0] == "polyworld":
+    continue
+  let
+    name = fields[0]
+    directory = dependencyDirectory(projectRoot, name)
+    source =
+      if dirExists(directory / "src"):
+        directory / "src"
+      else:
+        directory
+  switch("path", getEnv(name.toUpperAscii() & "_PATH", source))
+
+switch("define", "nimTypeNames")
+switch("define", "flatty64")
+when not defined(emscripten):
+  switch("define", "bassyNative")
 
 when not defined(debug):
-  --define:release
-  --define:noAutoGLerrorCheck
+  switch("define", "release")
+  switch("define", "noAutoGLerrorCheck")

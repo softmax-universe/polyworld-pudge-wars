@@ -2,7 +2,8 @@
 
 import
   std/[os, strformat, strutils, tables],
-  polyworld/[cli, profiles, tapes],
+  polyworld/[profiles, tapes],
+  pudgewars/cli,
   content,
   maps,
   sim,
@@ -10,29 +11,26 @@ import
   practice,
   hybrid,
   replays,
-  netclient,
-  netsim,
-  netpredict
+  multiplayer
+
+export cli
 
 when defined(headless):
   import std/[times, monotimes]
   import branch
 
-type
-  NetRole* = enum
-    ## How this process relates to a match.
-    NetOff,   ## Ordinary local simulation.
-    NetHost,  ## Runs the authoritative sim and serves remote clients.
-    NetClient ## Follows a host's action tape over the network.
+var
+  serverAddress*, roomCode*: string
+  directPlay*: bool
 
 proc usage() =
   echo "Pudge Wars"
-  echo "  --bot:PATH              Fill butcher slots with that script."
-  echo "  --bot:PATH:N            Fill N slots with that file."
-  echo "  --bot PATH[:N]          The equivalent two-argument form."
-  echo "  --human[:SLOT]          A human drives one slot (0-based;"
-  echo "                          default the first free slot)."
-  echo "                          Repeatable. Bots fill the rest."
+  when defined(headless):
+    echo commonUsageFor(AllCommonFlags - GraphicalFlags - {ServerFlag, RoomFlag})
+  else:
+    echo commonUsageFor(AllCommonFlags - {HeadlessTickRateFlag})
+  echo "  --practice-player N     Add another human practice seat (one-based)."
+  echo "                          Repeatable; bots fill the remaining seats."
   echo "  --team-size N           N vs N, N=1..5 (default 3). Spawns"
   echo "                          2N butchers. --duel is still the"
   echo "                          ladder 1v1 (slot 1 of the 3-lane pads)."
@@ -44,7 +42,6 @@ proc usage() =
   echo "                          .jsonl, summary.json, history.jsonl)"
   echo "                          under DIR. Defaults to duels/ in duel"
   echo "                          mode; also works for NvN and replays."
-  echo "  --replay PATH           Play an action replay instead of bots."
   echo "  --branch PATH           Headless: score decision windows of a"
   echo "                          recorded match by counterfactual rollout"
   echo "                          (see --branch-ticks, --branch-slot)."
@@ -60,11 +57,6 @@ proc usage() =
   echo "                          each window (one teacher row each)."
   echo "  --branch-bot PATH       Script for the other seats after the"
   echo "                          branch (default players/base.bas)."
-  echo "  --record PATH           Record match actions to a replay."
-  echo "  --seconds NUMBER        Duration in seconds (default 1200)."
-  echo "  --minutes NUMBER        Duration in minutes (default 20)."
-  echo "  --ticks NUMBER          Duration in ticks (default 38400)."
-  echo "  --seed NUMBER           Live game map seed."
   echo "  --killGoal NUMBER       First team to NUMBER kills wins" &
     " (default " & $KillGoal & ")."
   echo "  --botEvery NUMBER       Bots decide every NUMBER ticks" &
@@ -108,97 +100,10 @@ proc usage() =
   echo "  --quickcast             Hook casts on key press at the cursor."
   echo "  --autocast              Meat Hook autocast: RMB an enemy throws."
   echo "  --keys PATH             Key bindings file (action = KeyName)."
-  echo "  --mute                  Start with the sound off (default; M toggles)."
-  echo "  --sound                 Start with the sound on."
-  echo "  --play=false            Start the graphical transport paused."
-  echo "  --speed NUMBER          Graphical start speed: 1, 2, 4, or 16."
-  echo "  --windowSize WxH        Graphical window, such as 1024x576."
   echo "  --windowPos X,Y         Place the window at screen point X,Y (top-left)."
-  echo "  --vsync:off             Unlock the frame rate (default on)."
-  echo "  --host                  Serve a lobby so friends can join over"
-  echo "                          the network (needs bots on all 2N seats;"
-  echo "                          fills them with base.bas when unset)."
-  echo "  --port NUMBER           Lobby port for --host (default 8000)."
-  echo "  --autostart             Skip the lobby: the hosted match runs"
-  echo "                          at once and joiners drop in mid-game."
-  echo "  --join URL              Join a hosted match, for example"
-  echo "                          ws://192.168.1.10:8000/ws"
-  echo "  --slot NUMBER           Seat to request when joining (1-10;"
-  echo "                          default spectate)."
-  echo "  --name TEXT             Your player name for networked play."
-  echo "  --label TEXT            Nameplate for the next seat (repeat"
-  echo "                          once per butcher; coworld / replay)."
-  echo "  --token TEXT            Seat token from the lobby page (the"
-  echo "                          browser client passes this itself)."
-  echo "  --netsim SPEC           Dev network sim on the follower:"
-  echo "                          local|good|poor|extreme|off, or"
-  echo "                          100+/-50 or 250+/-40,loss=2 (NETSIM.md)."
-  echo "  --netsim-latency MS     One-way delay; overrides --netsim."
-  echo "  --netsim-jitter MS      +/- variation around latency."
-  echo "  --netsim-loss PERCENT   Outbound packet loss 0..100."
+  echo "  --label TEXT            Per-seat nameplate for local replay tools."
   echo "Compile with -d:headless for command-line simulation."
   echo "Compile with -d:emscripten for the web backend."
-
-proc takePwDurationFlag(
-    options: var GameOptions,
-    arguments: seq[string],
-    index: var int,
-    argument: string
-): bool =
-  ## `--seconds` / `--minutes` / `--ticks` at this game's 32 Hz tick rate.
-  var
-    name = ""
-    text = ""
-  if argument.startsWith("--seconds="):
-    name = "--seconds"
-    text = argument[10 .. ^1]
-  elif argument.startsWith("--minutes="):
-    name = "--minutes"
-    text = argument[11 .. ^1]
-  elif argument.startsWith("--ticks="):
-    name = "--ticks"
-    text = argument[8 .. ^1]
-  else:
-    case argument
-    of "--seconds", "--minutes", "--ticks":
-      name = argument
-      text = arguments.argumentValue(index, argument)
-    else:
-      return false
-  let count = parsePositiveInt32(text, name)
-  var ticks = int64(count)
-  case name
-  of "--seconds":
-    ticks = int64(count) * int64(TickRate)
-  of "--minutes":
-    ticks = int64(count) * 60'i64 * int64(TickRate)
-  of "--ticks":
-    discard
-  else:
-    return false
-  if ticks > int32.high:
-    fail(name & " is too large")
-  options.maximumTicks = int32(ticks)
-  options.seconds = options.maximumTicks div TickRate
-  true
-
-proc addHumanSlot(options: var GameOptions, text: string) =
-  ## Adds one human seat: an explicit slot index or the first free one.
-  var slot = -1'i32
-  if text.len > 0:
-    slot = parseInt32(text, "--human")
-    if slot < 0 or slot >= MaxPudgeCount:
-      fail("--human slot must be between 0 and " & $(MaxPudgeCount - 1))
-  else:
-    for candidate in 0'i32 ..< int32(MaxPudgeCount):
-      if candidate notin options.humanSlots:
-        slot = candidate
-        break
-    if slot < 0:
-      fail("every slot already has a human")
-  if slot in options.humanSlots:
-    fail("slot " & $slot & " already has a human")
-  options.humanSlots.add slot
 
 proc addPilotSlot(options: var GameOptions, text: string) =
   ## Adds one model-driven seat: an explicit slot or the first free one.
@@ -242,23 +147,21 @@ proc findStockBot(): string =
   ]:
     if fileExists(candidate):
       return candidate
-  fail(
-    "need players/base.bas (run from the repo root) or an explicit --bot PATH"
-  )
+  result = getTempDir() / "pudge-base.bas"
+  writeFile(result, StockBotSource)
 
 proc findChallengerScript(): string =
   ## The evolving duel policy, looked up from the repo root or the
   ## example directory.
+  const ChallengerSource = staticRead("players/challenger.bas")
   for candidate in [
     "examples/pudge_wars/players/challenger.bas",
     "players/challenger.bas"
   ]:
     if fileExists(candidate):
       return candidate
-  fail(
-    "--duel needs players/challenger.bas (run from the repo root) " &
-    "or an explicit --bot PATH"
-  )
+  result = getTempDir() / "pudge-challenger.bas"
+  writeFile(result, ChallengerSource)
 
 when defined(headless):
   var branchOptions*: BranchOptions
@@ -357,42 +260,29 @@ proc takeBranchFlag(options: var GameOptions, arguments: seq[string],
     false
 
 proc parseGameOptions(): GameOptions =
-  # killGoal and duration start unset (zero) so duel mode can pick its
-  # own defaults after the flags are read.
+  ## Parses common launch options and Pudge's match and practice settings.
+  # Goal and duration stay unset until the match mode chooses its defaults.
   result = GameOptions(
-    seed: 2026,
-    speed: 1,
-    windowWidth: 1024,
-    windowHeight: 576,
     botEvery: 1,
-    runeSeconds: -1,
-    joinSlot: -1,
-    mute: true
+    runeSeconds: -1
   )
-  var
-    netsimSpec = ""
-    netsimHasLatency = false
-    netsimHasJitter = false
-    netsimHasLoss = false
-    netsimLatency = 0
-    netsimJitter = 0
-    netsimLoss = 0.0
+  result.seed = 2026
+  result.tickRate = TickRate
   let arguments = commandLineParams()
   var index = 0
   while index < arguments.len:
     let argument = arguments[index]
-    if result.takePwDurationFlag(arguments, index, argument):
-      discard
-    elif result.takeBranchFlag(arguments, index, argument):
+    if splitFlag(argument).name in ["--practice-player", "--duel",
+      "--practice", "--pilot", "--hybrid"]:
+        directPlay = true
+    if result.takeBranchFlag(arguments, index, argument):
       discard
     elif takeThresholdFlag(arguments, index, argument):
       discard
     elif result.takeCommonFlag(arguments, index, argument):
       discard
-    elif argument == "--human":
-      result.addHumanSlot("")
-    elif argument.startsWith("--human:"):
-      result.addHumanSlot(argument[8 .. ^1])
+    elif splitFlag(argument).name == "--practice-player":
+      result.addPracticePlayer(arguments.flagValue(index, argument))
     elif argument == "--duel":
       result.duel = true
     elif argument == "--team-size":
@@ -429,10 +319,6 @@ proc parseGameOptions(): GameOptions =
       result.quickcast = true
     elif argument == "--autocast":
       result.autocast = true
-    elif argument == "--mute":
-      result.mute = true
-    elif argument == "--sound":
-      result.mute = false
     elif argument == "--keys":
       result.keysPath = arguments.argumentValue(index, "--keys")
     elif argument.startsWith("--keys="):
@@ -467,74 +353,10 @@ proc parseGameOptions(): GameOptions =
       )
     elif argument.startsWith("--difficulty="):
       result.applyDifficulty(argument[13 .. ^1])
-    elif argument == "--host":
-      if result.hostPort == 0:
-        result.hostPort = 8000
-    elif argument == "--autostart":
-      result.autoStart = true
-    elif argument == "--port":
-      result.hostPort = parsePositiveInt32(
-        arguments.argumentValue(index, "--port"), "--port"
-      )
-    elif argument.startsWith("--port="):
-      result.hostPort = parsePositiveInt32(argument[7 .. ^1], "--port")
-    elif argument == "--join":
-      result.joinUrl = arguments.argumentValue(index, "--join")
-    elif argument.startsWith("--join="):
-      result.joinUrl = argument[7 .. ^1]
-    elif argument == "--slot":
-      result.joinSlot = parsePositiveInt32(
-        arguments.argumentValue(index, "--slot"), "--slot"
-      ) - 1
-    elif argument.startsWith("--slot="):
-      result.joinSlot = parsePositiveInt32(argument[7 .. ^1], "--slot") - 1
-    elif argument == "--name":
-      result.playerName = arguments.argumentValue(index, "--name")
-    elif argument.startsWith("--name="):
-      result.playerName = argument[7 .. ^1]
     elif argument == "--label":
       result.seatLabels.add arguments.argumentValue(index, "--label")
     elif argument.startsWith("--label="):
       result.seatLabels.add argument[8 .. ^1]
-    elif argument == "--token":
-      result.joinToken = arguments.argumentValue(index, "--token")
-    elif argument.startsWith("--token="):
-      result.joinToken = argument[8 .. ^1]
-    elif argument == "--netsim" or argument.startsWith("--netsim="):
-      netsimSpec =
-        if argument.startsWith("--netsim="): argument[9 .. ^1]
-        else: arguments.argumentValue(index, "--netsim")
-    elif argument == "--netsim-latency" or
-        argument.startsWith("--netsim-latency="):
-      let text =
-        if argument.startsWith("--netsim-latency="): argument[17 .. ^1]
-        else: arguments.argumentValue(index, "--netsim-latency")
-      let value = parseInt32(text, "--netsim-latency")
-      if value < 0:
-        fail("--netsim-latency must be >= 0")
-      netsimHasLatency = true
-      netsimLatency = int(value)
-    elif argument == "--netsim-jitter" or
-        argument.startsWith("--netsim-jitter="):
-      let text =
-        if argument.startsWith("--netsim-jitter="): argument[16 .. ^1]
-        else: arguments.argumentValue(index, "--netsim-jitter")
-      let value = parseInt32(text, "--netsim-jitter")
-      if value < 0:
-        fail("--netsim-jitter must be >= 0")
-      netsimHasJitter = true
-      netsimJitter = int(value)
-    elif argument == "--netsim-loss" or argument.startsWith("--netsim-loss="):
-      let text =
-        if argument.startsWith("--netsim-loss="): argument[14 .. ^1]
-        else: arguments.argumentValue(index, "--netsim-loss")
-      try:
-        netsimLoss = parseFloat(text)
-      except ValueError:
-        fail("--netsim-loss must be a number")
-      if netsimLoss < 0.0 or netsimLoss > 100.0:
-        fail("--netsim-loss must be between 0 and 100")
-      netsimHasLoss = true
     else:
       case argument
       of "--help", "-h":
@@ -543,29 +365,11 @@ proc parseGameOptions(): GameOptions =
       else:
         fail("unknown argument: " & argument)
     inc index
-  if netsimSpec.len > 0 or netsimHasLatency or netsimHasJitter or
-      netsimHasLoss:
-    # Preset/spec first, then individual overrides, so flag order does
-    # not matter: `--netsim poor --netsim-jitter 80` is 250±80.
-    var cfg: NetSimConfig
-    if netsimSpec.len > 0:
-      let (ok, parsed) = parseNetSimArg(netsimSpec)
-      if not ok:
-        fail("--netsim expects local|good|poor|extreme|off or " &
-          "100+/-50[,loss=2], got: " & netsimSpec)
-      cfg = parsed
-    else:
-      cfg = NetSimConfig(
-        enabled: true, latencyMs: 0, jitterMs: 0, packetLossPercent: 0.0,
-        delayOutbound: true, delayInbound: true)
-    if netsimHasLatency: cfg.latencyMs = netsimLatency
-    if netsimHasJitter: cfg.jitterMs = netsimJitter
-    if netsimHasLoss: cfg.packetLossPercent = netsimLoss
-    if netsimHasLatency or netsimHasJitter or netsimHasLoss:
-      cfg.enabled = true
-    netSimConfigure(cfg)
-    if cfg.enabled:
-      netSimSetLogging(true)
+  serverAddress = result.serverUrl
+  roomCode = result.roomCode
+  result.configurePlayerSlot()
+  if result.botGroups.len > 0 or result.playerSlot > 0:
+    directPlay = true
   # Unset goal and duration take the mode's defaults: duels are
   # shorter so the play-analyze-improve loop turns around quickly.
   if result.teamSize == 0:
@@ -577,42 +381,24 @@ proc parseGameOptions(): GameOptions =
   if result.killGoal <= 0:
     result.killGoal = if result.duel: DuelKillGoal else: KillGoal
   if result.maximumTicks <= 0:
-    let minutes = if result.duel: DuelMinutes else: DefaultMinutes
+    let minutes = if result.duel: DuelMinutes else: cli.DefaultMinutes
     result.maximumTicks = minutes * 60 * TickRate
     result.seconds = result.maximumTicks div TickRate
   if result.duel:
-    if result.hostPort != 0 or result.joinUrl.len > 0 or result.autoStart:
-      fail("--duel is a local mode; it cannot combine with --host or --join")
     for slot in result.humanSlots:
       if slot >= DuelPudgeCount:
-        fail("--duel seats are 0 (west) and 1 (east)")
+        fail("--duel player slots are 1 (west) and 2 (east)")
   if result.botAimNoise < 0:
     fail("--botAimNoise must be zero or positive")
   if result.runeSeconds >= 0 and
       int64(result.runeSeconds) * int64(TickRate) > int64(int32.high):
     fail("--runes is too large")
-  if result.joinSlot >= MaxPudgeCount:
-    fail("--slot must be between 1 and " & $MaxPudgeCount)
-  if result.joinUrl.len > 0:
-    if hybridSlots.len > 0 or tacticalShadowSlots.len > 0:
-      fail("tactical modes cannot be combined with --join")
-    # A joining client follows the host's tape; nothing local applies.
-    if result.hostPort != 0:
-      fail("--join cannot be combined with --host")
-    if result.replayPath.len > 0 or result.recordPath.len > 0:
-      fail("--join cannot be combined with --replay or --record")
-    if result.botGroups.len > 0 or result.humanSlots.len > 0:
-      fail("--join cannot be combined with --bot or --human; " &
-        "use --slot to pick a seat")
-    return
-  if result.autoStart and result.hostPort == 0:
-    fail("--autostart requires --host")
   let seats =
     if result.duel: DuelPudgeCount
     else: matchPudgeCount(int(result.teamSize))
   for slot in result.humanSlots:
     if slot >= seats:
-      fail("--human slot " & $slot & " is outside this roster of " & $seats)
+      fail("human slot " & $(slot + 1) & " is outside this roster of " & $seats)
   for slot in result.pilotSlots:
     if slot >= seats:
       fail("--pilot slot " & $slot & " is outside this roster of " & $seats)
@@ -624,37 +410,26 @@ proc parseGameOptions(): GameOptions =
     if slot < 0 or slot >= seats: fail("--tactical-shadow slot is outside the roster")
     if slot in hybridSlots or int32(slot) in result.pilotSlots:
       fail("tactical shadow seats cannot overlap hybrid or pilot seats")
-  if tacticalShadowSlots.len > 0 and (result.hostPort != 0 or result.replayPath.len > 0):
+  if tacticalShadowSlots.len > 0 and result.replayPath.len > 0:
     fail("--tactical-shadow is currently supported for local live matches only")
   if hybridSlots.len > 0:
     if result.pilotSlots.len > 0:
       fail("--hybrid cannot share a match with blocking --pilot seats")
-    if result.hostPort != 0 or result.replayPath.len > 0:
+    if result.replayPath.len > 0:
       fail("--hybrid is currently supported for local live matches only")
     if result.coachEndpoint.len == 0: result.coachEndpoint = "local"
   if hybridPlan.len > 0 and hybridSlots.len != 1:
     fail("--hybrid-plan requires exactly one --hybrid seat")
-  if result.pilotSlots.len > 0 and result.hostPort != 0:
-    fail("--pilot cannot be combined with --host")
-  if result.hostPort != 0:
-    if result.replayPath.len > 0:
-      fail("--host cannot be combined with --replay")
-    if result.botGroups.len == 0:
-      # Every hosted seat needs script autopilot so a leaver's butcher
-      # keeps fighting; fill the roster with the stock bot.
-      result.botGroups.addBotSpec(findStockBot() & ":" & $seats)
-    if result.botGroups.botCount != seats:
-      fail(
-        "--host needs bot scripts for all " & $seats &
-        " seats (autopilot for leavers); configured " &
-        $result.botGroups.botCount
-      )
-    if result.humanSlots.len > 1:
-      fail("--host claims at most one --human seat for the host player")
-  result.validateGameOptions(0, "")
-  if result.replayPath.len == 0:
+  when defined(headless):
+    result.common.rejectUnsupportedFlags(AllCommonFlags - {ServerFlag, RoomFlag})
+  result.validateGameOptions(0, "",
+    localLaunch = directPlay or result.matchLogDir.len > 0)
+  if result.matchLogDir.len > 0:
+    directPlay = true
+  if result.replayPath.len == 0 and
+    (defined(headless) or defined(takeScreenshot) or directPlay):
     if result.duel and result.botGroups.len == 0 and
-        result.humanSlots.len < seats:
+        result.humanSlots.len + result.pilotSlots.len < seats:
       # A bare duel pits the seats without humans against the
       # evolving challenger policy.
       result.botGroups.addBotSpec(
@@ -662,19 +437,14 @@ proc parseGameOptions(): GameOptions =
           $(seats - result.humanSlots.len - result.pilotSlots.len)
       )
     elif result.botGroups.len == 0:
-      # Local --human and spectate: stock autopilot on every seat.
-      # --host already filled above. Human seats still take input;
-      # the VM is fallback if they release (T).
-      result.botGroups.addBotSpec(findStockBot() & ":" & $seats)
-    let
-      bots = result.botGroups.botCount
-      humans = result.humanSlots.len
-    if bots != seats and bots + humans != seats:
-      fail(
-        "live games need bots for all " & $seats &
-        " seats or all " & $(seats - humans) &
-        " non-human seats; configured " & $bots
-      )
+      let needed = seats - result.humanSlots.len - result.pilotSlots.len
+      if needed > 0:
+        result.botGroups.addBotSpec(findStockBot() & ":" & $needed)
+    result.validateGameOptions(seats, "live games require bots for every non-human seat")
+  result.resolveGamePaths()
+  if result.verbose:
+    echo "launch: seed ", result.seed, " ticks ", result.maximumTicks,
+      " bots ", result.botGroups.botCount, " humans ", result.humanSlots.len
 
 var options* = parseGameOptions()
 
@@ -687,64 +457,35 @@ proc optionRunePeriod*(): int32 =
 
 var
   run*: Game
-  predictor* = newPredictor()
-    ## Client-side prediction for a WASM human seat. Enabled only by the
-    ## emscripten graphics loop; stays disabled (a no-op passthrough) for
-    ## native, LAN, host, and replay, so those paths render bit-for-bit
-    ## the confirmed world exactly as before.
-  netRole* = NetOff
-    ## Whether this process hosts, follows, or plays alone.
+  activeNetwork*: NetworkMatch
+  networkActive*: bool
   localSeat* = -1
-    ## Roster seat this process's input drives; -1 spectates. Distinct
-    ## from `run.humanSlots`, which lists every human-driven seat in
-    ## the match (a host tracks its remote players there too).
 
-proc netPlayerName*(): string =
-  ## The display name for networked play.
-  if options.playerName.len > 0:
-    return options.playerName
-  if options.hostPort != 0: "Host" else: "Player"
+proc installGame*(newRun: Game, humanSeat = -1, networked = false) =
+  ## Installs the explicitly prepared match selected by the frontend.
+  run = newRun
+  localSeat = humanSeat
+  networkActive = networked
+  activeNetwork = nil
+  options.maximumTicks = newRun.maximumTicks
+  options.seed = newRun.map.seed
+  options.killGoal = newRun.world.killGoal
+  options.botEvery = newRun.botEvery
+  options.botAimNoise = newRun.botAimNoise
+  options.humanSlots.setLen(0)
+  if humanSeat >= 0:
+    options.humanSlots.add int32(humanSeat)
 
-proc overlayWorld*(): World =
-  ## World the HUD and overlays should read. A predicting WASM seat
-  ## uses the look-ahead copy so a local ping appears this frame.
-  if predictor.enabled and predictor.predicted != nil:
-    predictor.predicted.world
-  else:
-    run.world
-
-proc predictedPudge*(index: int): Pudge =
-  ## The state to render for one roster seat. The local WASM seat draws
-  ## from the prediction world (so a click moves it this frame); every
-  ## other seat, and every non-predicting build, draws the confirmed
-  ## world unchanged. Same pudge `id` either way, so the render-space
-  ## interpolators stay keyed correctly.
-  if index < 0 or index >= run.world.pudges.len:
-    return
-  result = run.world.pudges[index]
-  if predictor.enabled and predictor.predicted != nil and
-      index == predictor.seat and
-      index < predictor.predicted.world.pudges.len:
-    result = predictor.predicted.world.pudges[index]
-    # Draw the smoothed position so a misprediction teleport (high latency /
-    # jitter) eases out instead of snapping. Render-only: `result` is a value
-    # copy, and the sim/prediction worlds keep the true position.
-    let rp = localRenderPoint(predictor)
-    result.position.x = rp.x
-    result.position.z = rp.z
-
-proc validateNetSetup(setup: Setup) =
-  ## Rejects a host running an incompatible build before the world is
-  ## created from its setup.
-  if setup.tickRate != uint16(TickRate):
-    fail("host runs at " & $setup.tickRate & " Hz, this build at " &
-      $TickRate & " Hz")
-  if setup.gridTiles != ReplayGridTiles:
-    fail("host map size does not match this build")
-  if setup.pudges.len < DuelPudgeCount or setup.pudges.len > MaxPudgeCount:
-    fail("host match does not have 2 to " & $MaxPudgeCount & " butchers")
-  if setup.maximumTicks == 0 or setup.killGoal <= 0:
-    fail("host sent an invalid match setup")
+proc releaseGame*() =
+  ## Releases local services and clears the completed match.
+  if run != nil:
+    practiceFinish(run)
+    hybridFinish(run)
+    closeBotServices(run)
+  activeNetwork = nil
+  networkActive = false
+  localSeat = -1
+  run = nil
 
 when not defined(emscripten):
   import duellog
@@ -753,8 +494,9 @@ when not defined(emscripten):
     ## Structured per-match analysis log; nil when logging is off.
 
   proc duelLoggingWanted(): bool =
-    ## Local matches log when duel mode or an explicit --duellog asks.
-    netRole == NetOff and (options.duel or options.matchLogDir.len > 0)
+    ## Captures keep only explicitly requested logs, not automatic duel logs.
+    not networkActive and (options.matchLogDir.len > 0 or
+      (options.duel and not options.capture.captureRequested()))
 
   proc duelLogBase(): string =
     if options.matchLogDir.len > 0: options.matchLogDir
@@ -796,109 +538,66 @@ proc closeDuelLogging*() =
   else:
     discard
 
-proc newFollowerGame*(setup: Setup): Game =
-  ## Builds the follower world for one hosted match: the host's map
-  ## seed, an empty streamed tape, and playback locked to it. The
-  ## client runs no bots and records nothing - the stream is the tape.
-  validateNetSetup(setup)
+proc initializeGame*() =
+  ## Builds an explicit command-line local match or replay.
+  releaseGame()
+  startGameProfile()
+  var
+    replayMode = options.replayPath.len > 0
+    mapSeed = options.seed
+    replayData: ReplayData
+  if replayMode:
+    profileBlock "replay":
+      replayData = loadReplay(options.replayPath)
+    mapSeed = replayData.header.setup.mapSeed
   var gameMap: MapData
   profileBlock "map":
-    gameMap = generateMapMatching(setup.mapSeed, setup.mapHash)
-  if gameMap.hash != setup.mapHash:
-    fail("map generation differs from the host; update this build")
-  result = Game(
-    world: newWorld(
-      gameMap,
-      int32(setup.maximumTicks),
-      setup.pudges,
-      setup.killGoal,
-      setup.runePeriod
-    ),
-    map: gameMap,
-    maximumTicks: int32(setup.maximumTicks),
-    botEvery: max(setup.botEvery, 1'i32),
-    botAimNoise: max(setup.botAimNoise, 0'i32),
-    botSpeech: newSeq[BotSpeech](setup.pudges.len),
-    historyPlayback: true,
-    replayPlayer: ReplayPlayer(data: initReplayData(setup))
-  )
-  for i, pudge in setup.pudges:
-    if pudge.controller == ControllerHuman:
-      result.humanSlots.add i
-  if setup.seatLabels.len > 0:
-    applySeatLabels(result, setup.seatLabels)
-
-block:
-  startProfileTrace()
-  if options.joinUrl.len > 0:
-    netRole = NetClient
-    let boot = netBootstrap(
-      options.joinUrl,
-      netPlayerName(),
-      options.joinToken,
-      options.joinSlot
-    )
-    if not boot.ok:
-      fail("join failed: " & boot.error)
-    run = newFollowerGame(boot.setup)
-    localSeat = netClientSeat()
-  else:
-    if options.hostPort != 0:
-      netRole = NetHost
-    var
-      replayMode = options.replayPath.len > 0
-      mapSeed = options.seed
-      replayData: ReplayData
     if replayMode:
-      profileBlock "replay":
-        replayData = loadReplay(options.replayPath)
-      mapSeed = replayData.header.setup.mapSeed
-    var gameMap: MapData
-    profileBlock "map":
-      if replayMode:
-        gameMap = generateMapMatching(
-          mapSeed, replayData.header.setup.mapHash
-        )
-      elif options.duel:
-        gameMap = generateMap(mapSeed, TeamSize)
-      else:
-        gameMap = generateMap(mapSeed, int(options.teamSize))
-    let configuredTicks =
-      if replayMode: int32(replayData.header.setup.maximumTicks)
-      else: options.maximumTicks
-    run = newGame(
-      gameMap, configuredTicks, replayMode, replayData, options.killGoal,
-      optionRunePeriod(), options.duel
-    )
-    if replayMode:
-      run.maximumTicks = int32(replayData.hashes.len)
-      run.replayPlayer = initReplayPlayer(replayData)
-      run.historyPlayback = true
-      # Controller provenance from the tape, so analysis logs label
-      # human and bot seats correctly on playback.
-      for i, pudge in replayData.header.setup.pudges:
-        if pudge.controller == ControllerHuman:
-          run.humanSlots.add i
+      gameMap = generateMapMatching(
+        mapSeed, replayData.header.setup.mapHash
+      )
+    elif options.duel:
+      gameMap = generateMap(mapSeed, TeamSize)
     else:
-      for slot in options.humanSlots:
-        run.humanSlots.add int(slot)
-      if options.humanSlots.len > 0:
-        localSeat = run.humanSlots[0]
-      for slot in options.pilotSlots:
-        run.humanSlots.add int(slot)
-      run.botEvery = max(options.botEvery, 1'i32)
-      run.botAimNoise = max(options.botAimNoise, 0'i32)
-      loadBots(run, options.botGroups, hybridSlots)
-    if options.seatLabels.len > 0:
-      applySeatLabels(run, options.seatLabels)
-    elif replayMode and replayData.header.setup.seatLabels.len > 0:
-      applySeatLabels(run, replayData.header.setup.seatLabels)
-    when not defined(emscripten):
-      startDuelLogging()
+      gameMap = generateMap(mapSeed, int(options.teamSize))
+  let configuredTicks =
+    if replayMode: int32(replayData.header.setup.maximumTicks)
+    else: options.maximumTicks
+  run = newGame(
+    gameMap, configuredTicks, replayMode, replayData, options.killGoal,
+    optionRunePeriod(), options.duel
+  )
+  if replayMode:
+    run.maximumTicks = int32(replayData.hashes.len)
+    run.replayPlayer = initReplayPlayer(replayData)
+    run.historyPlayback = true
+    # Controller provenance from the tape, so analysis logs label
+    # human and bot seats correctly on playback.
+    for i, pudge in replayData.header.setup.pudges:
+      if pudge.controller == ControllerHuman:
+        run.humanSlots.add i
+  else:
+    for slot in options.humanSlots:
+      run.humanSlots.add int(slot)
+    if options.humanSlots.len > 0:
+      localSeat = run.humanSlots[0]
+    for slot in options.pilotSlots:
+      run.humanSlots.add int(slot)
+    run.botEvery = max(options.botEvery, 1'i32)
+    run.botAimNoise = max(options.botAimNoise, 0'i32)
+    loadBots(run, options.botGroups, hybridSlots)
+  if options.seatLabels.len > 0:
+    applySeatLabels(run, options.seatLabels)
+  elif replayMode and replayData.header.setup.seatLabels.len > 0:
+    applySeatLabels(run, replayData.header.setup.seatLabels)
+  when not defined(emscripten):
+    startDuelLogging()
 
 proc advanceGame*() {.measure.} =
   hybridTick(run)
   tickWorld(run, proc() = runBotDecisions(run))
+  if options.waitForLlm:
+    run.waitForBotRequests()
   practiceTick(run)
   when not defined(emscripten):
     logDuelTick(matchLog, run)
@@ -906,8 +605,8 @@ proc advanceGame*() {.measure.} =
 proc beginPractice*() =
   ## Starts the decision-model coach (--practice) and pilots (--pilot)
   ## for this match. The exact action tape lands beside the trace unless
-  ## --record chose another path. A network follower never coaches.
-  if netRole == NetClient or run.replayMode:
+  ## --record chose another path. Multiplayer uses deterministic inputs.
+  if networkActive or run.replayMode:
     return
   hybridReset()
   if not thresholdsOff:
@@ -961,10 +660,7 @@ proc beginPractice*() =
     let shadow = shadowBegin(run, int(slot), matchDir)
     if shadow.enabled:
       echo "shadow seat ", slot, ": ", shadow.dir
-  if matchDir.len > 0 and (options.recordPath.len == 0 or
-      options.recordPath.startsWith(practiceDataDir()) or
-      (options.practiceDir.len > 0 and
-        options.recordPath.startsWith(options.practiceDir))):
+  if matchDir.len > 0 and options.recordPath.len == 0:
     options.recordPath = matchDir / "replay.pwr"
 
 proc vmStatus*(): tuple[active, decisions: int] =
@@ -1003,127 +699,6 @@ proc saveRecording*() =
     saveReplay(path, run.recorder.data)
     echo &"replay saved: {path} " &
       &"({run.recorder.data.actions.len} actions)"
-
-var
-  rosterOverride: seq[ReplayPudge]
-  botGroupsOverride: seq[BotGroup]
-
-proc setRosterExperiment*(disabled: openArray[bool]) =
-  ## Applies the host lobby's seat toggles: builds the compacted
-  ## roster and the per-seat bot list (disabling seat 3 removes seat
-  ## 3's persona specifically). All seats enabled clears the override.
-  rosterOverride.setLen(0)
-  botGroupsOverride.setLen(0)
-  var any = false
-  let n = int(options.teamSize)
-  let seats = matchPudgeCount(n)
-  for i, off in disabled:
-    if i >= seats:
-      break
-    if off:
-      any = true
-      break
-  if not any or options.duel:
-    return
-  rosterOverride = filteredRoster(disabled, n)
-  var flat: seq[string]
-  for group in options.botGroups:
-    for _ in 0 ..< group.count:
-      flat.add group.path
-  for seat in 0 ..< seats:
-    if (seat < disabled.len and disabled[seat]) or seat >= flat.len:
-      continue
-    botGroupsOverride.addBotSpec(flat[seat] & ":1")
-
-proc activeRoster*(): seq[ReplayPudge] =
-  rosterOverride
-
-proc activeBotGroups*(): seq[BotGroup] =
-  if botGroupsOverride.len > 0: botGroupsOverride
-  else: options.botGroups
-
-proc rebuildWithRoster*() =
-  ## Rebuilds the lobby's preview world with the compacted roster just
-  ## before a hosted start. Same arena, fewer seats.
-  run = newGame(
-    run.map, options.maximumTicks, false, ReplayData(), options.killGoal,
-    optionRunePeriod(), options.duel, activeRoster()
-  )
-  run.botEvery = max(options.botEvery, 1'i32)
-  run.botAimNoise = max(options.botAimNoise, 0'i32)
-  loadBots(run, activeBotGroups(), hybridSlots)
-
-proc fillBotsTo*(count: int) =
-  ## Grows or trims `options.botGroups` so `loadBots` can fill `count`
-  ## seats. Extra seats repeat the stock autopilot.
-  var flat: seq[string]
-  for group in options.botGroups:
-    for _ in 0 ..< group.count:
-      flat.add group.path
-  if flat.len > count:
-    flat.setLen(count)
-  while flat.len < count:
-    flat.add findStockBot()
-  options.botGroups.setLen(0)
-  for path in flat:
-    options.botGroups.addBotSpec(path & ":1")
-
-proc applyTeamSize*(n: int): bool =
-  ## Live lobby / local N stepper. Regenerates the map (extra pads
-  ## stamp extra roads) and rebuilds the world. No-op once a hosted
-  ## match has started, in duel, replay, or as a follower.
-  if options.duel or run.replayMode or netRole == NetClient:
-    return false
-  let next = clampTeamSize(n)
-  if next == int(options.teamSize):
-    return false
-  options.teamSize = int32(next)
-  rosterOverride.setLen(0)
-  botGroupsOverride.setLen(0)
-  fillBotsTo(matchPudgeCount(next))
-  let gameMap = generateMap(run.map.seed, next)
-  run = newGame(
-    gameMap, options.maximumTicks, false, ReplayData(), options.killGoal,
-    optionRunePeriod(), false
-  )
-  run.botEvery = max(options.botEvery, 1'i32)
-  run.botAimNoise = max(options.botAimNoise, 0'i32)
-  loadBots(run, options.botGroups, hybridSlots)
-  true
-
-proc restartMatch*() =
-  ## Rematch on the same arena: a fresh world with the launch options
-  ## and seats, keeping the already-baked map and terrain. When
-  ## recording, the finished match's tape is saved first (the record
-  ## path holds the most recent completed match). A network follower
-  ## instead rebuilds from the host's next `Start`. Analysis logging
-  ## rolls over to a fresh match directory.
-  if run.replayMode or netRole == NetClient:
-    return
-  closeDuelLogging()
-  saveRecording()
-  run = newGame(
-    run.map, options.maximumTicks, false, ReplayData(), options.killGoal,
-    optionRunePeriod(), options.duel, activeRoster()
-  )
-  for slot in options.humanSlots:
-    run.humanSlots.add int(slot)
-  if netRole == NetOff:
-    localSeat = if options.humanSlots.len > 0: run.humanSlots[0] else: -1
-  for slot in options.pilotSlots:
-    run.humanSlots.add int(slot)
-  run.botEvery = max(options.botEvery, 1'i32)
-  run.botAimNoise = max(options.botAimNoise, 0'i32)
-  loadBots(run, activeBotGroups(), hybridSlots)
-  when not defined(emscripten):
-    startDuelLogging()
-
-proc netClientRestart*(setup: Setup) =
-  ## Rebuilds the follower world when the host rematches. The map seed
-  ## matches the old arena (rematches keep it), so baked terrain stays
-  ## valid.
-  run = newFollowerGame(setup)
-  localSeat = netClientSeat()
 
 when defined(headless):
   proc printHeadlessSummary(steps: int, started: float64) =
@@ -1175,6 +750,9 @@ when defined(headless):
     runBranch(run, opts)
 
   proc runHeadless*() =
+    ## Runs one explicit offline match, recording and validating its tape.
+    initializeGame()
+    defer: releaseGame()
     if branchOptions.path.len > 0:
       runBranchHeadless()
       return
@@ -1188,26 +766,34 @@ when defined(headless):
     if not run.replayMode:
       startReplayRecording(uint32(stepLimit))
     beginPractice()
-    startProfileTrace()
+    startGameProfile()
     defer:
-      finishProfileTrace()
+      finishGameProfile()
     var steps = 0
     # Headless network hybrids run on the game's wall clock. Inference never
     # freezes simulated time. Offline interventions remain accelerated.
     let realtime = hybridSlots.len > 0 and hybridPlan.len == 0 and
       coachConfig(options.coachEndpoint, options.coachModel).endpoint.len > 0
-    let clockStart = getMonoTime()
+    let
+      pace =
+        if HeadlessTickRateFlag in options.specifiedFlags:
+          options.headlessTickRate
+        elif realtime:
+          TickRate
+        else:
+          0
+      clockStart = getMonoTime()
     while steps < stepLimit and
         (run.replayMode or not run.world.gameOver) and
         run.recordingError.len == 0:
-      if realtime:
-        let remaining = int64(steps) * 1_000_000_000 div int64(TickRate) -
+      if pace > 0:
+        let remaining = int64(steps) * 1_000_000_000 div int64(pace) -
           (getMonoTime() - clockStart).inNanoseconds
         if remaining > 0: sleep(int((remaining + 999_999) div 1_000_000))
       advanceGame()
       inc steps
       if profileShouldDump(steps):
-        finishProfileTrace()
+        finishGameProfile()
     practiceFinish(run)
     hybridFinish(run)
     if run.recordingError.len > 0:

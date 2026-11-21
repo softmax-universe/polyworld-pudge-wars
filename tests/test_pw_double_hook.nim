@@ -1,5 +1,5 @@
 ## Complete two-hook sequences through the real BASIC VM and simulator.
-import std/[os, unittest], polyworld/cli,
+import std/[os, unittest], pudgewars/cli,
   ../examples/pudge_wars/[bots, content, maps, replays, sim]
 
 const DoubleHookPolicy {.strdefine.} = ""

@@ -1,7 +1,7 @@
 ## Behavioral contracts for a bot playing beside a human, not just against bots.
 import
   std/[os, unittest],
-  polyworld/cli,
+  pudgewars/cli,
   ../examples/pudge_wars/[bots, content, maps, replays, sim, teammates]
 
 const TeammatePolicy {.strdefine.} = ""

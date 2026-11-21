@@ -1,38 +1,25 @@
-name: Test Pudge Wars BASIC league
+name: Test Pudge Wars units
 on:
   pull_request:
   push:
     branches: [main]
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 5
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
       - uses: treeform/setup-nim-action@v6
         with:
           nim-version: '2.2.10'
-      - name: Install Python test dependency
-        run: python3 -m pip install websockets==15.0.1
       - name: Install pinned dependencies
         run: |
           nimby create
           nimby sync nimby.lock -g
-          {
-            echo '--path:"src"'
-            for dir in "$HOME"/.nimby/pkgs/*; do
-              [ -d "$dir" ] || continue
-              if [ -d "$dir/src" ]; then
-                echo "--path:\"$dir/src\""
-              else
-                echo "--path:\"$dir\""
-              fi
-            done
-          } > nim.cfg
-      - name: Test VM, simulation, replay and runner contracts
-        run: bash scripts/test_league.sh
+      - name: Test CLI, VM, simulation and replay units
+        run: bash scripts/test_league.sh --unit

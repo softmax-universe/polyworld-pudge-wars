@@ -366,6 +366,12 @@ proc logActions(logger: DuelLogger, game: Game) =
       event["amount"] = %action.second
     of ActionRotToggle:
       event["act"] = %"rot"
+    of ActionChat:
+      event["act"] = %"chat"
+      event["slot"] = %action.first
+      event["team"] = %action.second
+      event["name"] = %action.name
+      event["text"] = %action.text
     else:
       event["act"] = %"takeover"
     logger.emit(event)

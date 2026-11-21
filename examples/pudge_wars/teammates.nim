@@ -1,6 +1,6 @@
 ## Read-only team planning. These checks choose bot actions; they never
 ## change hook collision, human controls, fog, or the replay rules.
-import polyworld/[fixed, pathing], content, sim
+import polyworld/[pathing], fixxy, content, sim
 
 const TeamPingTicks* = TickRate * 3
 
@@ -119,8 +119,10 @@ proc teamPingResponder*(game: Game, team: Team): int32 =
   let target = worldAtTile(int(ping.x), int(ping.y))
   var best = int64.high
   for i, pudge in game.world.pudges:
-    if i in game.humanSlots or i >= game.heroVms.len or
-        game.heroVms[i] == nil or game.heroVms[i].failed or
+    if i in game.humanSlots or
+        (not game.networked and
+          (i >= game.heroVms.len or game.heroVms[i] == nil or
+            game.heroVms[i].failed)) or
         pudge.id == ping.byId or pudge.team != team or pudge.state != Alive or
         pudge.hookedBy != 0 or pudge.inRiver or
         pudge.hp * 100 < pudge.maxHp * 40 or game.world.rotAffected(pudge):

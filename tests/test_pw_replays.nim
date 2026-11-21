@@ -7,6 +7,7 @@ import
   ../examples/pudge_wars/replays
 
 proc testSetup(): Setup =
+  ## Creates a valid replay setup for the codec and cursor tests.
   result = Setup(
     mapSeed: 2026,
     mapHash: 0x123456789ABCDEF0'u64,
@@ -28,6 +29,14 @@ proc testSetup(): Setup =
       spawnX: int32(if i < TeamSize: 22 else: 106),
       spawnZ: int32(40 + (i mod TeamSize) * 24)
     )
+
+proc rejectReplay(bytes: string, reason = "") =
+  ## Requires a replay-specific error for an invalid encoded tape.
+  try:
+    discard decodeReplay(bytes)
+    doAssert false, "invalid replay was accepted"
+  except ReplayError as error:
+    doAssert error.msg.contains(reason), error.msg
 
 let setup = testSetup()
 
@@ -53,12 +62,13 @@ let
   decoded = decodeReplay(encoded)
   fileHeader = replayFileHeader(encoded)
 doAssert encoded.startsWith(ReplayMagic)
+doAssert fileHeader.formatVersion == 2'u16
 doAssert fileHeader.formatVersion == ReplayFileVersion
 doAssert fileHeader.game == ReplayGame
+doAssert fileHeader.gameVersion == 39'u16
 doAssert fileHeader.gameVersion == ReplayGameVersion
 doAssert decoded.header.formatVersion == ReplayFormatVersion
-doAssert decoded.header.formatVersion == 5'u16,
-  "seat labels ship in replay format v5"
+doAssert decoded.header.formatVersion == 7'u16
 doAssert decoded.header.gameVersion == ReplayGameVersion
 doAssert decoded.header.setup.mapSeed == 2026
 doAssert decoded.header.setup.killGoal == KillGoal
@@ -71,6 +81,9 @@ doAssert decoded.header.setup.pudges[0].controller == ControllerHuman
 doAssert decoded.header.setup.pudges[1].controller == ControllerBot
 doAssert decoded.header.setup.pudges[0].spawnX == 22
 doAssert decoded.header.setup.pudges[3].spawnX == 106
+doAssert decoded.config.seed == setup.mapSeed
+doAssert decoded.config.maxTicks == int32(setup.maximumTicks)
+doAssert decoded.config.players == unnamedPlayers(PudgeCount)
 doAssert decoded.actions.len == 13
 doAssert decoded.actions[0].kind == ActionWalkTo
 doAssert decoded.actions[0].first == 52
@@ -342,7 +355,7 @@ block:
   except ReplayError as error:
     doAssert error.msg.contains("first at tick 2")
 
-echo "Testing seat labels round-trip on format v5"
+echo "Testing named tapes preserve seat labels"
 block:
   var named = testSetup()
   named.seatLabels = @[
@@ -350,42 +363,53 @@ block:
     "pudge-wars-rusher:v14 1", "pudge-wars-rusher:v14 2",
     "pudge-wars-rusher:v14 3"
   ]
-  let
-    namedRecorder = initReplayRecorder(named)
-    namedDecoded = decodeReplay(namedRecorder.data.encodeReplay())
+  let namedDecoded = decodeReplay(initReplayRecorder(named).data.encodeReplay())
   doAssert namedDecoded.header.formatVersion == ReplayFormatVersion
-  doAssert namedDecoded.header.setup.seatLabels == named.seatLabels
+  doAssert namedDecoded.header.setup == named
+  for i, label in named.seatLabels:
+    doAssert namedDecoded.config.players[i].name == label
 
-echo "Testing a format v4 tape still loads without names"
+echo "Testing development-only legacy envelopes are rejected"
+block:
+  var old = encoded
+  old[ReplayMagic.len] = '\x01'
+  rejectReplay(old, "Polyworld replay format version")
+
+echo "Testing incompatible envelopes, payloads, and truncated tapes"
 block:
   let
-    v4setup = SetupV4(
-      mapSeed: setup.mapSeed,
-      mapHash: setup.mapHash,
-      tickRate: setup.tickRate,
-      gridTiles: setup.gridTiles,
-      maximumTicks: setup.maximumTicks,
-      killGoal: setup.killGoal,
-      botEvery: setup.botEvery,
-      botAimNoise: setup.botAimNoise,
-      runePeriod: setup.runePeriod,
-      pudges: setup.pudges
-    )
-  var legacy = initActionTape[SetupV4, ReplayAction](
-    v4setup,
-    ReplayFormatVersionV4,
-    ReplayGameVersion
-  )
-  legacy.actions = decoded.actions
-  legacy.hashes = decoded.hashes
-  let
-    legacyBytes = encodeReplayFile(
-      ReplayGame, ReplayGameVersion, legacy, MaxReplayBytes
-    )
-    upgraded = decodeReplay(legacyBytes)
-  doAssert upgraded.header.formatVersion == ReplayFormatVersion
-  doAssert upgraded.header.setup.seatLabels.len == 0
-  doAssert upgraded.header.setup.pudges.len == PudgeCount
-  doAssert upgraded.actions.len == decoded.actions.len
+    offset = ReplayMagic.len + 6 + ReplayGame.len
+    olderGame = char(ReplayGameVersion - 1)
+    empty = initReplayData(setup)
+  for bytes in [encoded]:
+    var invalid = bytes
+    invalid[ReplayMagic.len] = '\x03'
+    rejectReplay(invalid, "Polyworld replay format version")
+
+    invalid = bytes
+    invalid[ReplayMagic.len + 2] = olderGame
+    rejectReplay(invalid, "game version")
+
+    invalid = bytes
+    invalid[ReplayMagic.len + 6] = 'g'
+    rejectReplay(invalid, "replay belongs to")
+
+    invalid = bytes
+    invalid[offset] = '\x03'
+    rejectReplay(invalid, "format version")
+
+    invalid = bytes
+    invalid[offset + 2] = olderGame
+    rejectReplay(invalid, "payload game version")
+
+  for bytes in [encoded, empty.encodeReplay()]:
+    for length in 0 ..< bytes.len:
+      rejectReplay(bytes[0 ..< length])
+
+  var tooLong = setup
+  tooLong.maximumTicks = high(uint32)
+  let tooLongData = initReplayData(tooLong)
+  rejectReplay(encodeReplayFile(ReplayGame, ReplayGameVersion, tooLongData),
+    "setup duration")
 
 echo "test_pw_replays: all checks passed"

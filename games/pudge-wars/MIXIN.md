@@ -19,10 +19,7 @@ The newer [gameplay skill-gradient investigation](../../docs/gameplay-skill-grad
 covers the current BASIC runtime, local paired-bank evaluation, threat selection,
 replay verification and concrete next gameplay experiments.
 
-Build/upload surface: `coworld/player/Dockerfile`, documented in
-[the player README](../../coworld/player/README.md). Build linux/amd64 and
-select the experimental arm with the `POLICY_ARM` build argument. The image
-starts `python -m coworld.examples.pudgewars.player.player`; register that argv
-explicitly at upload. Record each immutable upload immediately in
-[VERSION_LOG.md](players/pudge-wars-rusher/VERSION_LOG.md). Source/runtime pins
-remain those in META.md; a game rebuild is not needed for these Python changes.
+Run BASIC policies with [the local episode runner](../../coworld/GAME_HOSTED_MIGRATION.md#run-local-basic-episodes-without-docker).
+Use the [CoWorld agent guide](../../coworld/README.md) for the hosted fast-XP
+workflow. The [version log](players/pudge-wars-rusher/VERSION_LOG.md) records
+immutable uploads from past campaigns.

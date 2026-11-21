@@ -1,6 +1,6 @@
 ## Unequal-distance threat selection must not depend on hook iteration order.
 import std/[os, unittest], bassy,
-  polyworld/cli,
+  pudgewars/cli,
   ../examples/pudge_wars/[bots, content, maps, replays, sim]
 
 const ThreatPolicy {.strdefine.} = ""

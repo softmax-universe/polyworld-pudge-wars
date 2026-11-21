@@ -1,5 +1,8 @@
 # Hosted evaluation design for Pudge Wars
 
+This guide records prior Observatory campaigns and their release-specific tools.
+For current BASIC runs, use the [CoWorld agent guide](../../../../coworld/README.md).
+
 Use existing replays to diagnose, native full games to catch regressions, and
 hosted episodes to judge the actual uploaded policy. Keep the engine/rules,
 policy versions, observation timing and opponent identities explicit.

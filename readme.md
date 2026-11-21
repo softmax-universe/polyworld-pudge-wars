@@ -1,10 +1,9 @@
 # PolyWorld — Pudge Wars
 
-A self-contained slice of the **PolyWorld** engine plus **Pudge Wars**: a 3v3
-river arena where two banks of butchers fight to a kill goal with a
-skillshot meat hook, grapple, blink, and rot. Deterministic 32 Hz
-simulation, BASIC bots on empty seats, and a LAN/browser lobby so friends
-join from a native client or the browser (WASM).
+Pudge Wars is a river arena where two banks of butchers fight to a kill goal
+with a skillshot meat hook, grapple, blink and Rot. It uses the shared Polyworld
+engine for native and browser play, with a deterministic 32 Hz simulation,
+BASIC bots and shared-relay multiplayer.
 
 Engine design: [docs/engine-design.md](docs/engine-design.md).
 
@@ -18,13 +17,10 @@ https://fast-xp-k8s-prod.tail0f4a29.ts.net/ with Softmax Tailscale access.
 
 ## CoWorld package
 
-The league package now supports **Bassy BASIC file players**, using Polyworld's
-pinned VM and GotA-style game-hosted execution. The migration includes private
-seat logs/annotations and mixed-team OpenSkill league settings. See
-[the migration guide](coworld/GAME_HOSTED_MIGRATION.md) for local tests, file
-uploads and rollout. The separate `coworld/platform-hosted/` package retains
-Docker players and human play. The 3v3 league runs `pudge-wars-basic:0.1.4` with mixed human/BASIC seats;
-the sibling 1v1 league retains its existing runtime.
+The BASIC batch runner supports staged source and neural policy packages,
+private seat logs and annotations, and replay artifacts. See the
+[migration guide](coworld/GAME_HOSTED_MIGRATION.md) for the local runner
+contract and the history of the published leagues.
 
 Run local BASIC episodes without Docker:
 
@@ -34,7 +30,7 @@ python3 scripts/run_episode.py base:3 sniper:3 --seed 29 # 3v3
 python3 scripts/run_episode.py ./my-policy.bas support  # custom policy
 ```
 
-The runner builds the league host, runs to the kill goal or time limit, and
+The command builds the episode runner, runs to the kill goal or time limit, and
 saves results, replay, policy snapshots and per-seat logs under `tmp/episodes/`.
 Use `--binary tmp/pwleague` to reuse a build, `--ticks 1024` for a short episode,
 or `--list-policies` to see the bundled policies. See the
@@ -44,12 +40,11 @@ or `--list-policies` to see the bundled policies. See the
 
 | Path | What it is |
 |---|---|
-| `src/polyworld/` | Engine: sim helpers, renderer, HUD, audio, cameras, net, wasm recipe |
-| `examples/pudge_wars/` | The game — sim, bots, graphics, hosting, netcode |
-| `tests/test_pw_*.nim` | Headless tests (sim, maps, bots, replays, net, prediction, netsim) |
-| `tests/bench_pw_netlag.nim` | Prediction-quality bench under latency/jitter |
+| `src/pudgewars/` | Game-specific CLI and HUD helpers |
+| `examples/pudge_wars/` | Simulation, bots, graphics, frontend and multiplayer adapter |
+| `tests/test_pw_*.nim` | Simulation, bots, replays, frontend and relay adapter tests |
 | `scripts/setup.sh` | Installs Nimby, Nim 2.2.10, and the pinned packages |
-| `nimby.lock` | Pinned Nim package commits |
+| `nimby.lock` | Pinned shared Polyworld and Nim package commits |
 
 Dependency order inside the game:
 
@@ -64,9 +59,9 @@ Dependency order inside the game:
 | `game.nim` | CLI, match setup, headless runner |
 | `human.nim` | Mouse/keyboard → the same `record`/`apply` path bots use |
 | `graphics.nim` / `ui.nim` | Client only |
-| `hosting.nim` | Embedded HTTP + WebSocket lobby |
-| `netclient.nim` / `netpredict.nim` / `netproto.nim` | Follower: transport, client-side prediction + rollback, wire format |
-| `netsim.nim` | Dev network-condition simulator (latency/jitter/loss) — see [NETSIM.md](examples/pudge_wars/NETSIM.md) |
+| `frontend.nim` | Home, settings, local setup, room browser and lobby |
+| `multiplayer.nim` | Pudge Wars simulation and commands through the shared relay |
+| `episodes.nim` / `observations.nim` | Staged BASIC episodes and local JSON policy interfaces |
 | `players/*.bas` | Bot personas. Base and Rusher use the retained v16 Python strategy ported to BASIC. |
 
 ## Requirements
@@ -78,64 +73,21 @@ Dependency order inside the game:
 
 ## Setup
 
-```bash
-git clone git@github.com:softmax-universe/polyworld-pudge-wars.git
-cd polyworld-pudge-wars
-scripts/setup.sh
-export PATH="$HOME/.nimby/nim/bin:$HOME/.local/bin:$PATH"
-```
-
-`scripts/setup.sh` installs [Nimby](https://github.com/treeform/nimby), Nim
-**2.2.10**, and the packages in `nimby.lock` under `~/.nimby`, and writes a
-gitignored `nim.cfg` so the compiler finds them. Put the `export PATH=…` line
-in your shell profile.
-
-**Art** lives in a sibling checkout of the assets repo:
-
-```bash
-cd ..
-git clone https://github.com/softmax-universe/polyworld-data.git polyworld_data
-cd polyworld-pudge-wars
-```
-
-The build looks for `../polyworld_data` (models, textures, fonts, sounds). A
-missing model renders as a placeholder cube and never changes sim hashes, so
-headless tests pass without it — only the graphical client needs it.
-
-Confirm:
-
-```bash
-nim --version          # Nim Compiler Version 2.2.10
-ls ../polyworld_data   # characters, terrain, themes, sounds, ...
-```
+Follow [Build and run Pudge Wars](docs/building.md) for the shared Polyworld
+checkout, Nim 2.2.10, art, and native or WebAssembly builds.
 
 ## Play
 
-Always from the repo root. First run compiles; later runs are faster.
-
-For a browser 2v2 with a **live Jev coach and enemy-position likelihood map**, put
-`TYPESAFE_API_KEY` in `.env.local`, run `./scripts/coach_demo.sh`, then open
-**http://127.0.0.1:8787**. You play the human seat with live action cues,
-strategy advice and estimates based only on visible sightings.
-[Demo details](coaching/README.md).
-
-To play alongside the Coworld Python policy with deliberate healing and
-fishing spacing, run `uv run scripts/play_policy.py`. You control P1, with
-Base v13 teammates on P2–P3 and Base v10 opponents on P4–P6. This runs the
-current local game rules; [details and controls](coworld/player/README.md#play-alongside-this-policy-locally).
-The commands below use the native BASIC bots.
+From the repository root, build and open the native game. Choose **Single
+Player** for a local match with BASIC bots or **Multiplayer** for relay rooms.
 
 ```bash
-# You vs a 5-bot field
-nim r examples/pudge_wars/pw.nim --human
-
-# Spectate a full bot lobby
-nim r examples/pudge_wars/pw.nim
-
-# Release binary
 nim c -d:release -o:pw examples/pudge_wars/pw.nim
-./pw --human
+./pw
 ```
+
+Run `./pw --player` to start a local match directly, or see the
+[browser multiplayer runbook](docs/hosted-browser-client.md) to play online.
 
 Headless (no window; CI and bot pacing):
 
@@ -147,7 +99,7 @@ nim r examples/pudge_wars/pw.nim --replay /tmp/demo.pwr
 
 ## Practice with a decision model, natively
 
-The desktop app and `./pw --human --practice` run a coach on your seat with
+The desktop app and `./pw --player --practice` run a coach on your seat with
 no browser or server. A plate in the top-left corner shows the next move the
 model recommends, why, the key to use, and the plan for the next few
 exchanges. Low-health, hooked and incoming-hook cues are decided locally and
@@ -190,12 +142,12 @@ fine-aimed hook with a little lead, retreat and heal walk home, regroup
 closes toward a teammate, reposition and scout move along the river lip,
 dodge steps off a flying hook's line, upgrade spends the point. Without a
 model (or a confident answer) the pilot takes the first local cue, so it
-always plays. Pilots combine with `--human`, with each other, and with bots
-on the remaining seats; `--human` alone keeps you as the local seat, pilots
+always plays. Pilots combine with `--player`, with each other, and with bots
+on the remaining seats; `--player` alone keeps you as the local seat, pilots
 alone spectate.
 
 ```bash
-./pw --human --practice --coach local --pilot:1 --pilot:2   # the model as your teammates and coach
+./pw --player --practice --coach local --pilot:1 --pilot:2   # the model as your teammates and coach
 ./pw --pilot:0 --pilot:1 --pilot:2 --coach d1 --seconds 120  # headless: D1 vs the stock bots
 ```
 
@@ -238,33 +190,24 @@ examples/pudge_wars/macos/build_app.sh
 open "tmp/desktop/Pudge Wars.app"
 ```
 
-Move the app into Applications or onto your Desktop. Opening it starts a 3v3
-match with you on West and five BASIC bots, at fair difficulty, with the
-practice coach on (see above for the key file). Extra flags pass through:
-`open "tmp/desktop/Pudge Wars.app" --args --coach local --pilot:1`. It works offline
-and does not need this checkout after building. Logs are saved to
-`~/Library/Logs/Pudge Wars/game.log`.
+Opening the app shows the home screen. Single Player works from the installed
+bundle. To launch a coached local match directly, pass the practice flags with
+`open "tmp/desktop/Pudge Wars.app" --args --player --practice --coach local`.
+Logs are saved to `~/Library/Logs/Pudge Wars/game.log`.
 
 ## Controls
 
-Live matches automatically run at **87.5% speed when a human plays**: 28
-simulation ticks per real second instead of 32. Everyone in that match shares
-the slower clock, including bots. Hooks, movement, cooldowns and the match
-clock all slow together, giving you about 14% more reaction time. The pace stays
-slow through disconnects until the next match. Bot-only matches and normal
-replay playback retain their existing speed. Match limits are simulation time,
-so a human match's wall-clock time limit is 8/7 of the displayed duration.
-
-Native hosts and browser clients must both be rebuilt for this change (network
-protocol 14). `host_party.sh` rebuilds the browser bundle when `emcc` is available.
+Local matches with a human and shared-relay rooms run at **28 ticks per wall
+second**. Hooks, movement, cooldowns and the match clock share this pace.
+Offline bot-only matches and normal replay playback use the 32 Hz simulation
+clock. Match limits are simulation time, so a timed human match takes 8/7 of
+the displayed duration in wall time.
 
 For choppy native graphics on a laptop, try a smaller window with dynamic
 shadows disabled. This changes rendering cost separately from the game clock:
 
 ```sh
-SUN_SHADOWS=0 ./pw --human --windowSize 1280x800
-# Or host the same lighter local game for friends:
-SUN_SHADOWS=0 examples/pudge_wars/host_party.sh --human --name Aaron --windowSize 1280x800
+SUN_SHADOWS=0 ./pw --player --windowSize 1280x800
 ```
 
 The default players use the customized red and blue butcher. Preview and
@@ -282,63 +225,25 @@ controls are in [Butcher workshop](examples/pudge_wars/BUTCHER_WORKSHOP.md).
 | 1–4 | Spend kill points on hook upgrades |
 | G | Ping · F1 center · L follow · T take-over · M mute |
 | F3 | Debug / fog overlay |
-| F9 / F10 | Network debug panel / cycle the latency simulator preset |
+| F9 / F10 | In-game menu / team panel |
 
 `--keys FILE` rebinds with windy names, one `action = KeyName` per line.
 
-## Host a match with friends
+## Play with friends
 
-One person hosts; everyone else joins from a browser or a native `--join`.
+Connect to a shared Polyworld relay from **Multiplayer**. Join a public room,
+create a public or private room, or paste an invite. The owner starts the match
+once both banks have a controller. The
+[browser multiplayer runbook](docs/hosted-browser-client.md) covers relay setup,
+native and browser invitations, spectators and rematches.
 
-```bash
-examples/pudge_wars/host_party.sh --human --name Aaron
-```
-
-That builds `./pw`, builds the WASM bundle when `emcc` is on `PATH`, and
-copies the lobby URL to the clipboard on macOS. In the host window, claim a
-seat (1–6) and press **Enter** to start. Empty seats are bots; dropped humans
-fall back to bot autopilot.
-
-Native join:
-
-```bash
-./pw --join ws://192.168.1.10:8000/ws --name Ana --slot 3
-```
-
-See [examples/pudge_wars/playing_with_friends.md](examples/pudge_wars/playing_with_friends.md).
-
-## Testing under latency (local)
-
-The follower has a built-in network-condition simulator. Run a host, then
-join with a preset to feel and measure high latency/jitter locally:
-
-```bash
-# terminal 1 — host with 5 bots, one open seat, auto-start
-./pw --host --autostart --bot examples/pudge_wars/players/base.bas:5
-
-# terminal 2 — join as a follower under a simulated 250 ms link
-./pw --join ws://localhost:8000/ws --name LagTest --netsim poor
-```
-
-Presets: `local` (0 ms) · `good` (100 ms) · `poor` (250 ms) · `extreme`
-(500 ms). In-game **F9** shows the debug panel (ping, FPS, packet
-counters, rolling graph); **F10** cycles the preset. Full guide and the
-measurement bench: [examples/pudge_wars/NETSIM.md](examples/pudge_wars/NETSIM.md).
-
-Tests (headless, no window):
-
-```bash
-nim r tests/test_pw_sim.nim
-nim r tests/test_pw_predict.nim     # client prediction + render smoothing
-nim r tests/test_pw_netsim.nim      # latency/jitter/loss simulator
-nim r tests/test_pw_pacing.nim     # human clock, prediction and reconnect pace
-nim c -d:release -r tests/bench_pw_netlag.nim   # prediction quality vs latency
-```
+Run the local simulation and batch evaluation suite with
+`bash scripts/test_league.sh`. Test the Pudge relay adapter and lobby setup with
+`nim r tests/test_pw_multiplayer.nim` and `nim r tests/test_pw_frontend.nim`.
 
 ## License
 
-MIT. See [LICENSE](LICENSE). Art under `polyworld_data/` may carry additional
-notices next to the files.
+MIT. See [LICENSE](LICENSE). Check the asset notices alongside the game art.
 
 Neural ZIP policies and Jev judgments are supported through the shared GotA
 interfaces; see [inference setup and examples](coworld/INFERENCE.md).

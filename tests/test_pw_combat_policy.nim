@@ -2,7 +2,7 @@
 ## Candidate-only run: nim r -d:CombatPolicy=/absolute/candidate.bas ...
 import
   std/[os, unittest],
-  polyworld/cli,
+  pudgewars/cli,
   ../examples/pudge_wars/[bots, content, maps, replays, sim]
 
 const CombatPolicy {.strdefine.} = ""

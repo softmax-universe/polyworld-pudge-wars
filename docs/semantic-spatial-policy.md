@@ -58,23 +58,29 @@ The wider first candidate had lower crowding (35.4% → 7.0%) but won only 5/12 
 **Status:** use `support_spatial_12` for the spatial-coaching demonstration. The historical kill-margin-based automatic promotion gate does not promote it because the interval includes zero. This preserves the distinction between compliance with coaching and a proven stronger overall policy. All 80 coaching/symbolic unit tests pass; a v2 campaign can initialize, round-trip and complete a short native audit.
 
 
-## How to inspect and play
+## Run the symbolic policy locally
 
-The new live launcher selects this exact generated IR controller for your teammates and uses the existing native host and WASM renderer. From the repository root, with the existing coaching environment built:
+Build the native JSONL runner and evaluate the generated spatial policy from
+the repository root. The run saves the IR, generated controller and match
+result in a new output directory.
 
 ```sh
-tmp/coaching/venv/bin/python -m coaching.symbolic.play --port 8790
+mkdir -p tmp/coaching
+nim c -d:release -o:tmp/coaching/symbolic_match coaching/symbolic/native_match.nim
+python3 -m coaching.symbolic.evaluate coaching/policies/executable/spatial.policy.md \
+  --n 3 --ticks 256 --out tmp/coaching/spatial-smoke
 ```
 
-Open `http://127.0.0.1:8790/`. This starts a 3v3 game with you and two generated agents. `/policy` serves the exact IR snapshot, `/generated.py` serves the generated source, and `/api/state` exposes match progress and errors. Add `--autopilot` to spectate an all-agent game. The existing voice-coaching demo and native BASIC bot retain their separate controller selection; this command explicitly activates the generated semantic policy.
-
-The launcher completed a 256-tick native 3v3 smoke match with no driver errors, and the state, IR, generated-source and game-page endpoints returned HTTP 200. This is a transport/engine smoke check, not a completed human usability study or a visual browser assertion.
+The original live launcher completed a 256-tick native 3v3 smoke match and
+served its state, IR, generated source and game page. That result describes
+the original prototype. See the [multiplayer migration](../coworld/GAME_HOSTED_MIGRATION.md)
+for the change in local entry points.
 
 Reproduce the semantic and native checks:
 
 ```sh
 python3 -m unittest discover -s tests -p 'test_symbolic*.py' -q
-tmp/coaching/venv/bin/python -m unittest discover -s tests -p 'test_coaching*.py' -q
+uv run --with-requirements coaching/requirements.txt python -m unittest discover -s tests -p 'test_coaching*.py' -q
 nim c -d:release --hints:off --warnings:off -o:tmp/coaching/spatial_match coaching/symbolic/native_match.nim
 python3 -m coaching.symbolic.spatial_scenes --out tmp/coaching/my-wall-reproduction
 python3 -m coaching.symbolic.spatial_eval --out tmp/coaching/my-spatial-reproduction --phase confirmation --baseline tmp/coaching/spatial-compact-confirmation-20260910/reference.py --seeds 9232001 9232002 9232003 9232004 9232005 9232006

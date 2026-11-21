@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import asyncio
-import json
 import math
 import os
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import Any
 
 from .base import BasePolicy
 
@@ -222,35 +220,6 @@ def reset_memory() -> None:
     _last_fly = None
     _last_seen = None
     _base.reset()
-
-
-async def main() -> None:
-    import websockets
-
-    from ..shared.log_shipper import get_logger
-
-    logger = get_logger("pudgewars.player")
-    url = os.environ["COWORLD_PLAYER_WS_URL"]
-    logger.info("connecting personality=%s arm=%s", PERSONALITY, POLICY_ARM)
-    trace_batch = []
-    trace_tick = -256
-    async with websockets.connect(url, ping_timeout=None) as websocket:
-        async for raw_message in websocket:
-            message = cast(dict[str, Any], json.loads(raw_message))
-            if message.get("type") == "final" or message.get("done"):
-                if trace_batch:
-                    logger.info("policy_trace %s", json.dumps(trace_batch, separators=(",", ":")))
-                logger.info("received final message, exiting")
-                return
-            if message.get("type") == "observation":
-                await websocket.send(json.dumps(choose_action(message)))
-                if _base.events:
-                    trace_batch.extend(_base.events)
-                    _base.events.clear()
-                if trace_batch and (message["tick"] - trace_tick >= 256 or len(trace_batch) >= 32):
-                    logger.info("policy_trace %s", json.dumps(trace_batch, separators=(",", ":")))
-                    trace_batch.clear()
-                    trace_tick = message["tick"]
 
 
 def choose_action(obs: dict[str, Any]) -> dict[str, Any]:
@@ -1608,7 +1577,3 @@ def _partner_lead_half(target: dict[str, Any], reel: dict[str, Any]) -> list[flo
         float(target["x"]) + (float(reel["x"]) - float(target["x"])) / 2.0,
         float(target["y"]) + (float(reel["y"]) - float(target["y"])) / 2.0,
     ]
-
-
-if __name__ == "__main__":
-    asyncio.run(main())

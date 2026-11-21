@@ -22,10 +22,10 @@ MAX_TICKS = 64
 
 
 def human_view(observation, slot=0):
-    """Team vision is shared in coworld_host; only self changes perspective.
+    """Team members share vision; self identifies the current seat.
 
     Deliberately omit the teammate's accepted actions, print, and policy trace.
-    Never source context from the omniscient /global stream.
+    Use the fog-filtered team observation as context.
     """
     human = next((p for p in observation["visible"]["pudges"] if p["slot"] == slot), None)
     if human is None or human["team"] != observation["self"]["team"]:

@@ -1,6 +1,6 @@
 ## A completed reel onto a bounce tree must not teleport its visitor home.
 import
-  polyworld/[fixed, pathing, tapes],
+  polyworld/[pathing, tapes], fixxy,
   ../examples/pudge_wars/[content, maps, replays, sim]
 
 let map = generateMap(2026)

@@ -2,7 +2,7 @@
 ## The finisher gets its first decision when the allied hook approaches the enemy.
 ## This isolates timing, not readiness, team formation, or overall match strength.
 ## Emit every fixture, including those where terrain prevents an approach.
-import std/[os, json], polyworld/cli,
+import std/[os, json], pudgewars/cli,
   ../../../examples/pudge_wars/[bots, content, maps, replays, sim]
 if paramCount() != 1:
   quit "Usage: double_hook_scenarios path/to/policy.bas", 1

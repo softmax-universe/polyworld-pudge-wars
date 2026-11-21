@@ -1,7 +1,7 @@
 ## Answer-key rollouts: a recorded match branched at a decision window.
 import
   std/[json, os, sequtils, strutils],
-  polyworld/cli,
+  pudgewars/cli,
   ../examples/pudge_wars/bots,
   ../examples/pudge_wars/branch,
   ../examples/pudge_wars/content,

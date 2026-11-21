@@ -1,6 +1,6 @@
 # Text → symbolic policy → game → text
 
-The [spatial coaching intervention](../../docs/semantic-spatial-policy.md) adds stable lane ownership, a single rune responder, and occupied-route detours in versioned IR. Its [policy text](../policies/executable/spatial.policy.md) generates [this controller](../policies/spatial_generated.py). Run `tmp/coaching/venv/bin/python -m coaching.symbolic.play` to play with it using the native engine and existing browser renderer.
+The [spatial coaching intervention](../../docs/semantic-spatial-policy.md) adds stable lane ownership, a single rune responder, and occupied-route detours in versioned IR. Its [policy text](../policies/executable/spatial.policy.md) generates [this controller](../policies/spatial_generated.py). The [local evaluation command](../../docs/semantic-spatial-policy.md#run-the-symbolic-policy-locally) runs it in the native simulator.
 
 This experiment compiles the grounded seven-layer policy documents in `../policies/executable/` into explicit Python strategy programs. It extracts the executable calls and control flow back into text, regenerates the program, and tests both copies in Pudge Wars. The [grounding contract](../policies/executable/grounding.md) defines the supported subset and the remaining ontology work.
 

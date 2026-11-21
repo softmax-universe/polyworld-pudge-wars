@@ -18,9 +18,7 @@
 ## This module must not import anything that returns a float.
 
 import
-  polyworld/[
-    bodies, fixed, hashes, noises, pathing, profiles, rngs, tapes
-  ],
+  polyworld/[bodies, hashes, noises, pathing, profiles, rngs, tapes], fixxy,
   cheats,
   content,
   maps,
@@ -374,7 +372,7 @@ type
     tick*: int32
 
   MatchChatLine* = object
-    ## One typed match-chat line. Display-only: never hashed, never on the tape.
+    ## One display row projected from the ordered replay action stream.
     tick*: int32
     slot*: int32
       ## Roster index, or -1 for a spectator.
@@ -392,6 +390,8 @@ type
     hashCheck*: ReplayHashCheck
     historyPlayback*: bool
     replayMode*: bool
+    networked*: bool
+      ## Bot controllers may live on other participants.
     recordingError*: string
     heroVms*: seq[HeroVm]
     maximumTicks*: int32
@@ -416,11 +416,13 @@ type
       ## `players[].name`, or empty (nameplates fall back to P<id>).
       ## Uniquified when several seats share a name.
     chatLog*: seq[MatchChatLine]
-      ## Typed player chat. Display-only.
+      ## Bounded presentation derived from typed chat actions.
+    pendingActions: seq[ReplayAction]
+      ## Local input queued until the next simulation tick.
 
 const
   MaxMatchChat* = 48
-    ## Ring size for the display-only match chat.
+    ## Ring size for the visible chat projection.
 
 proc appendChat*(game: Game, line: MatchChatLine) =
   ## Pushes one chat row, collapsing a seat that repeats the same line.
@@ -435,9 +437,78 @@ proc appendChat*(game: Game, line: MatchChatLine) =
     game.chatLog.delete(0)
 
 proc clearChat*(game: Game) =
-  ## Drops the display-only match chat (seek, rematch, new tape).
+  ## Clears the visible chat projection before rebuilding or a new match.
   if game != nil:
     game.chatLog.setLen(0)
+
+proc chatAction(game: Game, line: MatchChatLine): ReplayAction =
+  ## Preserves the sender identity and text as one typed tape action.
+  if line.slot notin -1 ..< int32(game.world.pudges.len) or
+    line.team notin -1 .. 1 or not line.text.validChatText() or
+    not line.name.validChatText(MaxChatNameBytes):
+      raise newException(ReplayError, "Invalid Pudge Wars chat metadata")
+  ReplayAction(
+    tick: uint32(max(0'i32, line.tick)), kind: ActionChat,
+    pudgeId: (if line.slot < 0: 0'i32
+      else: game.world.pudges[int(line.slot)].id),
+    first: line.slot, second: line.team, name: line.name, text: line.text
+  )
+
+proc displayChat(game: Game, action: ReplayAction) =
+  ## Displays one recorded chat entry without appending to the tape.
+  game.appendChat(MatchChatLine(
+    tick: int32(action.tick), slot: action.first, team: action.second,
+    name: action.name, text: action.text
+  ))
+
+proc recordChat*(game: Game, line: MatchChatLine) =
+  ## Records and displays a chat entry at the current execution point.
+  var action = game.chatAction(line)
+  action.tick = uint32(game.world.tick)
+  game.recorder.record(action)
+  game.displayChat(action)
+
+proc queueChat*(game: Game, line: MatchChatLine): bool =
+  ## Queues offline chat for the next tick without changing existing history.
+  if game == nil or game.replayMode or game.historyPlayback or game.networked or
+    game.world.gameOver or game.world.tick >= game.maximumTicks or
+    game.pendingActions.len >= MaxQueuedIntents:
+      return false
+  try:
+    var action = game.chatAction(line)
+    action.tick = uint32(game.world.tick + 1)
+    game.pendingActions.add action
+    true
+  except ReplayError:
+    false
+
+proc restoreReplayCursor*(game: Game) =
+  ## Rebuilds chat and control state from the same ordered action prefix.
+  if game == nil or game.replayPlayer == nil:
+    return
+  if game.recorder != nil:
+    game.replayPlayer.data = game.recorder.data
+  let data = game.replayPlayer.data
+  game.humanSlots.setLen(0)
+  for i, pudge in data.header.setup.pudges:
+    if pudge.controller == ControllerHuman:
+      game.humanSlots.add i
+  game.clearChat()
+  game.pendingActions.setLen(0)
+  for action in data.actions:
+    if action.tick > uint32(game.world.tick):
+      break
+    if action.kind == ActionChat:
+      game.displayChat(action)
+    elif action.kind == ActionTakeOver:
+      for i, pudge in game.world.pudges:
+        if pudge.id == action.pudgeId:
+          let previous = game.humanSlots.find(i)
+          if action.first == int32(ControllerHuman) and previous < 0:
+            game.humanSlots.add i
+          elif action.first == int32(ControllerBot) and previous >= 0:
+            game.humanSlots.delete(previous)
+  game.replayPlayer.syncCursor(uint32(game.world.tick))
 
 var
   activeWalkLayer: int
@@ -543,7 +614,15 @@ proc safeMulDiv(num, mul, den: int64): int64 =
       d = d shr 1
   if d <= 0:
     return 0
-  roundDivision(n * mul, d)
+  let
+    numerator = n * mul
+    half = d div 2
+  # Preserve Pudge's legacy truncation when adding the rounding bias overflows.
+  if numerator == low(int64) or
+    (numerator >= 0 and numerator > high(int64) - half) or
+    (numerator < 0 and -numerator > high(int64) - half):
+      return numerator div d
+  roundDivision(numerator, d)
 
 proc `-`(first, second: WorldPoint): WorldPoint =
   WorldPoint(
@@ -1699,6 +1778,7 @@ proc currentSetup*(game: Game, maximumTicks: uint32): Setup =
   for i in 0 ..< min(labels.len, game.seatLabels.len):
     labels[i] = game.seatLabels[i]
   Setup(
+    networked: game.networked,
     mapSeed: game.map.seed,
     mapHash: game.map.hash,
     tickRate: uint16(TickRate),
@@ -3083,11 +3163,12 @@ proc idleAcquireTarget(world: World, index: int): int32 =
   if best > int64(AutoAcquireRange) * int64(AutoAcquireRange):
     result = 0
 
-proc runHumanIntents*(game: Game, slot: int) =
+proc runHumanIntents*(game: Game, slot: int, autoAcquire = true): bool {.discardable.} =
   ## Drains one human seat's queued commands through the same
   ## record-then-apply path the bot host functions use, so live play,
   ## replays, and hash checks cannot diverge. After the queue is empty,
-  ## an idle butcher auto-acquires a nearby enemy (recorded on the tape).
+  ## an idle butcher can auto-acquire a nearby enemy. Reports manual orders
+  ## so a relay handoff can preserve their priority across controller batches.
   if slot < 0 or slot >= game.world.pudges.len:
     return
   let
@@ -3195,8 +3276,8 @@ proc runHumanIntents*(game: Game, slot: int) =
 
   # A fresh walk/attack/stop this turn is an instruction: do not
   # immediately re-acquire (so S is not a no-op on the same tick).
-  if sawOrder:
-    return
+  if sawOrder or not autoAcquire:
+    return sawOrder
   let acquireId = idleAcquireTarget(game.world, slot)
   if acquireId == 0:
     return
@@ -3216,6 +3297,67 @@ proc runHumanIntents*(game: Game, slot: int) =
       )
   except ReplayError as error:
     game.recordingError = error.msg
+
+proc networkIntent(action: ReplayAction, index: int): HumanIntent =
+  ## Restores a recorded human command without running a bot controller.
+  const Commands: array[IntentKind, uint8] = [
+    ActionWalkTo, ActionHookTo, ActionHookToFine, ActionGrappleTo,
+    ActionGrappleToFine, ActionBuyPower, ActionAttackTarget, ActionBuyUpgrade,
+    ActionStop, ActionPing, ActionBlinkTo, ActionBlinkToFine, ActionPlaceWall,
+    ActionPlaceMine, ActionCheat, ActionRotToggle, ActionPlaceWard
+  ]
+  for kind, command in Commands:
+    if command == action.kind:
+      return HumanIntent(slot: int32(index), kind: kind,
+        a: action.first, b: action.second)
+  raise newException(ReplayError, "Recorded command has no human intent")
+
+proc applyNetworkActions*(game: Game, actions: openArray[ReplayAction],
+    humanSlots: seq[int]) =
+  ## Dispatches admitted inputs through the existing rotating hero phases.
+  let
+    world = game.world
+    recorder = game.recorder
+  game.recorder = nil
+  defer:
+    game.recorder = recorder
+  for offset in 0 ..< world.pudges.len:
+    let
+      index = (world.heroTurnStart + offset) mod world.pudges.len
+      human = index in humanSlots
+    var sawHumanOrder = false
+    for action in actions:
+      if action.pudgeId != world.pudges[index].id or
+        action.kind in {ActionChat, ActionTakeOver}:
+          continue
+      case action.source
+      of HumanCommand:
+        game.queueIntent(action.networkIntent(index))
+      of BotCommand:
+        if game.humanIntents.len > 0:
+          sawHumanOrder =
+            game.runHumanIntents(index, autoAcquire = false) or sawHumanOrder
+        world.applyReplayAction(action)
+      of RecordedAction:
+        raise newException(ReplayError, "Network replay contains a resolved action")
+    if human or game.humanIntents.len > 0:
+      game.runHumanIntents(index, autoAcquire = human and not sawHumanOrder)
+  world.heroTurnStart = (world.heroTurnStart + 1) mod world.pudges.len
+  game.humanSlots = humanSlots
+
+proc replayHumanSlots(game: Game, actions: openArray[ReplayAction]): seq[int] =
+  ## Applies ordered controller markers to the previous tick's human set.
+  result = game.humanSlots
+  for action in actions:
+    if action.kind != ActionTakeOver:
+      continue
+    for i, pudge in game.world.pudges:
+      if pudge.id == action.pudgeId:
+        let previous = result.find(i)
+        if action.first == int32(ControllerHuman) and previous < 0:
+          result.add i
+        elif action.first == int32(ControllerBot) and previous >= 0:
+          result.delete(previous)
 
 proc applyTakeOver*(game: Game, slot: int, human: bool): bool =
   ## Switches who drives one seat mid-match and records the handoff.
@@ -5142,6 +5284,8 @@ proc tickWorld*(game: Game, onHeroTurn: proc() {.closure.}) {.measure.} =
   if game.replayMode and
       world.tick >= game.replayData.hashes.len:
     return
+  if game.historyPlayback and world.tick == 0:
+    game.restoreReplayCursor()
   world.tick = world.tick +% 1
   for pudge in world.pudges.mitems:
     pudge.enteredRiver = false
@@ -5155,18 +5299,35 @@ proc tickWorld*(game: Game, onHeroTurn: proc() {.closure.}) {.measure.} =
     pudge.justMulti = 0
     pudge.justFirstBlood = false
     pudge.justBounty = 0
+  var replayActions: seq[ReplayAction]
   if game.historyPlayback:
     if game.recorder != nil:
       game.replayPlayer.data = game.recorder.data
     var action: ReplayAction
     while game.replayPlayer.takeActionAt(uint32(world.tick), action):
-      applyReplayAction(world, action)
+      if game.networked:
+        replayActions.add action
+      elif action.kind == ActionChat:
+        game.displayChat(action)
+      elif action.kind == ActionTakeOver:
+        game.humanSlots = game.replayHumanSlots([action])
+      else:
+        applyReplayAction(world, action)
+  else:
+    for action in game.pendingActions:
+      game.recorder.record(action)
+      if action.kind == ActionChat:
+        game.displayChat(action)
+    game.pendingActions.setLen(0)
   profileBlock "heroTurn":
     dec world.heroTurnTicks
     if world.heroTurnTicks <= 0:
       world.heroTurnTicks += DecisionTicks
       if game.historyPlayback:
-        if world.pudges.len > 0:
+        if game.networked:
+          game.applyNetworkActions(replayActions,
+            game.replayHumanSlots(replayActions))
+        elif world.pudges.len > 0:
           world.heroTurnStart =
             (world.heroTurnStart + 1) mod world.pudges.len
       else:
@@ -5191,6 +5352,10 @@ proc tickWorld*(game: Game, onHeroTurn: proc() {.closure.}) {.measure.} =
     world.stepDeaths()
     world.resolveOverlaps()
     world.checkWinner()
+  if game.historyPlayback and game.networked:
+    for action in replayActions:
+      if action.kind == ActionChat:
+        game.displayChat(action)
   profileBlock "hash":
     let hash = game.stateHash()
     if game.historyPlayback:
@@ -5259,6 +5424,7 @@ proc newGame*(
     world: newWorld(map, maximumTicks, setup, goal, runes),
     map: map,
     replayMode: replayMode,
+    networked: replayMode and replayData.header.setup.networked,
     replayData: replayData,
     maximumTicks: maximumTicks,
     botEvery: 1,
